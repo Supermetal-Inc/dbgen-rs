@@ -1,0 +1,36 @@
+[package]
+name = "dbgen-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+env_logger = "0.10.0"
+log = "0.4.20"
+deadpool-postgres = "0.14.1"
+tokio-postgres = { version = "0.7.16", features = ["with-chrono-0_4"] }
+pg_bigdecimal = "0.1.5"
+
+tiberius = { version = "0.12", default-features = false, features = [
+    "tds73",
+    "chrono",
+] }
+chrono = "0.4"
+tokio = { version = "1.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+tpchgen = "2.0.2"
+tpchgen-arrow = "2.0.2"
+clap = { version = "4.5", features = ["derive"] }
+arrow = "57.1"
+deadpool-tiberius = "0.1"
+
+[patch.crates-io]
+tiberius = { git = "https://github.com/shubhamsinha/tiberius-optimized", rev = "aa206487f8bdcbd4e1b5ce71344a8b5e22413cb8" }
+deadpool-tiberius = { git = "https://github.com/shubhamsinha/deadpool-tiberius", rev = "ec871125e192aaec3c9d1f080802d90755dde4e5" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
