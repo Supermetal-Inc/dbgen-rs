@@ -8,7 +8,7 @@ use dbgen_rs::tpch::{
 };
 use log::info;
 use std::sync::Arc;
-use tiberius::{IntoSql, TokenRow};
+use tiberius::{IntoSql, TokenRow, numeric::Numeric};
 
 #[derive(Parser)]
 #[command(name = "sqlserver")]
@@ -57,29 +57,12 @@ fn value_to_sql(row: &mut TokenRow<'static>, val: &TypedValue) {
         TypedValue::Int64(v) => row.push(v.into_sql()),
         TypedValue::Utf8(v) => row.push(v.clone().into_sql()),
         TypedValue::Date32(v) => {
-            let s = v.map(|days| {
-                let date = UNIX_EPOCH + chrono::Duration::days(days as i64);
-                date.format("%Y-%m-%d").to_string()
-            });
-            row.push(s.into_sql());
+            let date = v.map(|days| UNIX_EPOCH + chrono::Duration::days(days as i64));
+            row.push(date.into_sql());
         }
         TypedValue::Decimal128(v, scale) => {
-            let s = v.map(|val| {
-                if *scale == 0 {
-                    return val.to_string();
-                }
-                let sign = if val < 0 { "-" } else { "" };
-                let abs = val.unsigned_abs();
-                let divisor = 10_u128.pow(*scale as u32);
-                format!(
-                    "{}{}.{:0>width$}",
-                    sign,
-                    abs / divisor,
-                    abs % divisor,
-                    width = *scale as usize
-                )
-            });
-            row.push(s.into_sql());
+            let numeric = v.map(|val| Numeric::new_with_scale(val, *scale as u8));
+            row.push(numeric.into_sql());
         }
     }
 }
@@ -94,14 +77,6 @@ fn arrow_type_to_sql(dt: &DataType) -> Result<String> {
         DataType::Date32 => "DATE".into(),
         DataType::Decimal128(p, s) => format!("DECIMAL({}, {})", p, s),
         _ => bail!("unsupported Arrow type for SQL Server: {:?}", dt),
-    })
-}
-
-fn arrow_type_to_bulk_safe(dt: &DataType) -> Result<String> {
-    Ok(match dt {
-        DataType::Date32 => "NVARCHAR(10)".into(),
-        DataType::Decimal128(_, _) => "NVARCHAR(40)".into(),
-        _ => arrow_type_to_sql(dt)?,
     })
 }
 
@@ -201,7 +176,7 @@ impl TpchBackend for SqlServerBackend {
                 Ok(format!(
                     "{} {}",
                     quote_ident(f.name()),
-                    arrow_type_to_bulk_safe(f.data_type())?
+                    arrow_type_to_sql(f.data_type())?
                 ))
             })
             .collect::<Result<_>>()?;
@@ -294,7 +269,32 @@ impl TpchBackend for SqlServerBackend {
     }
 
     fn needs_temp_for_snapshot() -> bool {
-        true
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tiberius::ColumnData;
+
+    #[test]
+    fn bulk_rows_use_native_date_and_decimal_values() {
+        let mut row = TokenRow::new();
+        value_to_sql(&mut row, &TypedValue::Date32(Some(0)));
+        value_to_sql(&mut row, &TypedValue::Decimal128(Some(12_345), 2));
+
+        assert!(matches!(row.get(0), Some(ColumnData::Date(Some(_)))));
+        let Some(ColumnData::Numeric(Some(numeric))) = row.get(1) else {
+            panic!("expected a native numeric value");
+        };
+        assert_eq!(numeric.value(), 12_345);
+        assert_eq!(numeric.scale(), 2);
+    }
+
+    #[test]
+    fn snapshots_bulk_load_directly_to_the_target() {
+        assert!(!SqlServerBackend::needs_temp_for_snapshot());
     }
 }
 
