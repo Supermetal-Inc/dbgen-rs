@@ -14,6 +14,7 @@ pg_bigdecimal = "0.1.5"
 tiberius = { version = "0.12", default-features = false, features = [
     "tds73",
     "chrono",
+    "native-tls",
 ] }
 chrono = "0.4"
 tokio = { version = "1.0", features = ["full"] }
@@ -26,8 +27,8 @@ arrow = "57.1"
 deadpool-tiberius = "0.1"
 
 [patch.crates-io]
-tiberius = { git = "https://github.com/shubhamsinha/tiberius-optimized", rev = "aa206487f8bdcbd4e1b5ce71344a8b5e22413cb8" }
-deadpool-tiberius = { git = "https://github.com/shubhamsinha/deadpool-tiberius", rev = "ec871125e192aaec3c9d1f080802d90755dde4e5" }
+tiberius = { git = "https://github.com/shubhamsinha/tiberius-optimized", rev = "57b68bc9d54fa0d044d78940d97a4a243e8cdd8c" }
+deadpool-tiberius = { git = "https://github.com/shubhamsinha/deadpool-tiberius", rev = "d85c8df34325d6be2a95196bb513b1fe1d4a07b5" }
 
 [profile.release]
 lto = true
