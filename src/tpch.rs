@@ -1,8 +1,8 @@
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use arrow::array::{
     Array, Date32Array, Decimal128Array, Int32Array, Int64Array, StringArray, StringViewArray,
 };
@@ -37,7 +37,11 @@ pub fn parse_tables(tables: &str) -> Result<Vec<String>> {
     let names: Vec<String> = tables.split(',').map(|s| s.trim().to_lowercase()).collect();
     for name in &names {
         if !ALL_TABLES.contains(&name.as_str()) {
-            bail!("unknown table: '{}'. valid tables: {}", name, ALL_TABLES.join(", "));
+            bail!(
+                "unknown table: '{}'. valid tables: {}",
+                name,
+                ALL_TABLES.join(", ")
+            );
         }
     }
     Ok(names)
@@ -55,6 +59,22 @@ pub fn get_pk_columns(table: &str) -> &'static [&'static str] {
         "lineitem" => &["l_orderkey", "l_linenumber"],
         _ => panic!("unknown table: {}", table),
     }
+}
+
+pub fn format_decimal128(val: i128, scale: i8) -> String {
+    if scale == 0 {
+        return val.to_string();
+    }
+    let sign = if val < 0 { "-" } else { "" };
+    let abs = val.unsigned_abs();
+    let divisor = 10_u128.pow(scale as u32);
+    format!(
+        "{}{}.{:0>width$}",
+        sign,
+        abs / divisor,
+        abs % divisor,
+        width = scale as usize
+    )
 }
 
 pub fn get_comment_column(table: &str) -> &'static str {
@@ -116,20 +136,26 @@ impl TpchTable {
             "region" => TpchTable::Region(RegionArrow::new(RegionGenerator::default())),
             "nation" => TpchTable::Nation(NationArrow::new(NationGenerator::default())),
             "supplier" => TpchTable::Supplier(SupplierArrow::new(SupplierGenerator::new(
-                scale_factor, 1, 1,
+                scale_factor,
+                1,
+                1,
             ))),
             "customer" => TpchTable::Customer(CustomerArrow::new(CustomerGenerator::new(
-                scale_factor, 1, 1,
+                scale_factor,
+                1,
+                1,
             ))),
             "part" => TpchTable::Part(PartArrow::new(PartGenerator::new(scale_factor, 1, 1))),
             "partsupp" => TpchTable::PartSupp(PartSuppArrow::new(PartSuppGenerator::new(
-                scale_factor, 1, 1,
+                scale_factor,
+                1,
+                1,
             ))),
-            "orders" => {
-                TpchTable::Orders(OrderArrow::new(OrderGenerator::new(scale_factor, 1, 1)))
-            }
+            "orders" => TpchTable::Orders(OrderArrow::new(OrderGenerator::new(scale_factor, 1, 1))),
             "lineitem" => TpchTable::LineItem(LineItemArrow::new(LineItemGenerator::new(
-                scale_factor, 1, 1,
+                scale_factor,
+                1,
+                1,
             ))),
             _ => bail!("unknown table: {}", name),
         })
@@ -202,9 +228,7 @@ impl TypedArray<'_> {
         match self {
             TypedArray::Int32(a) => TypedValue::Int32((!a.is_null(idx)).then(|| a.value(idx))),
             TypedArray::Int64(a) => TypedValue::Int64((!a.is_null(idx)).then(|| a.value(idx))),
-            TypedArray::Utf8(a) => {
-                TypedValue::Utf8((!a.is_null(idx)).then(|| a.value(idx).into()))
-            }
+            TypedArray::Utf8(a) => TypedValue::Utf8((!a.is_null(idx)).then(|| a.value(idx).into())),
             TypedArray::Utf8View(a) => {
                 TypedValue::Utf8((!a.is_null(idx)).then(|| a.value(idx).into()))
             }
@@ -287,7 +311,8 @@ pub fn batch_rows(batch: &RecordBatch) -> Result<BatchRowIter<'_>> {
 
 pub trait TpchBackend: Send + Sync + 'static {
     fn drop_table(&self, table: &str) -> impl Future<Output = Result<()>> + Send;
-    fn create_table(&self, table: &str, schema: &Schema) -> impl Future<Output = Result<()>> + Send;
+    fn create_table(&self, table: &str, schema: &Schema)
+    -> impl Future<Output = Result<()>> + Send;
     fn create_temp_table(
         &self,
         table: &str,
@@ -314,6 +339,10 @@ pub trait TpchBackend: Send + Sync + 'static {
     fn truncate_table(&self, table: &str) -> impl Future<Output = Result<()>> + Send;
     fn drop_temp_table(&self, table: &str) -> impl Future<Output = Result<()>> + Send;
     fn needs_temp_for_snapshot() -> bool;
+
+    fn is_blocking() -> bool {
+        false
+    }
 }
 
 pub async fn run<B: TpchBackend>(backend: Arc<B>, mode: Mode) -> Result<()> {
@@ -349,13 +378,20 @@ async fn run_snapshot<B: TpchBackend>(backend: Arc<B>, args: SnapshotArgs) -> Re
     }
 
     let mut set: JoinSet<Result<(String, usize)>> = JoinSet::new();
+    let handle = tokio::runtime::Handle::current();
     for table in tables {
         let backend = Arc::clone(&backend);
         let sf = args.scale_factor;
-        set.spawn(async move {
+        let task = async move {
             let n = load_table_snapshot::<B>(backend, table.clone(), sf).await?;
-            Ok((table, n))
-        });
+            Ok::<_, anyhow::Error>((table, n))
+        };
+        if B::is_blocking() {
+            let handle = handle.clone();
+            set.spawn_blocking(move || handle.block_on(task));
+        } else {
+            set.spawn(task);
+        }
     }
 
     while let Some(result) = set.join_next().await {
@@ -412,20 +448,24 @@ async fn run_cdc<B: TpchBackend>(backend: Arc<B>, args: CdcArgs) -> Result<()> {
     let start = std::time::Instant::now();
 
     let mut set: JoinSet<Result<()>> = JoinSet::new();
+    let handle = tokio::runtime::Handle::current();
     for (i, table) in tables.iter().enumerate() {
         let backend = Arc::clone(&backend);
         let total_ops = Arc::clone(&total_ops);
         let sf = args.scale_factor;
         let table = table.clone();
-        // Give the first table any remainder so total rate is preserved
         let rate = if i == 0 {
             args.rate - rate_per_table * (n - 1)
         } else {
             rate_per_table
         };
-        set.spawn(async move {
-            cdc_worker::<B>(backend, table, rate, sf, total_ops, start).await
-        });
+        let task = async move { cdc_worker::<B>(backend, table, rate, sf, total_ops, start).await };
+        if B::is_blocking() {
+            let handle = handle.clone();
+            set.spawn_blocking(move || handle.block_on(task));
+        } else {
+            set.spawn(task);
+        }
     }
 
     while let Some(result) = set.join_next().await {
@@ -467,7 +507,11 @@ async fn cdc_worker<B: TpchBackend>(
                 source = TpchTable::new(&table, scale_factor)?.with_batch_size(batch_size);
                 match source.next() {
                     Some(b) => b,
-                    None => bail!("[{}]: generator produced no batches at sf={}", table, scale_factor),
+                    None => bail!(
+                        "[{}]: generator produced no batches at sf={}",
+                        table,
+                        scale_factor
+                    ),
                 }
             }
         };

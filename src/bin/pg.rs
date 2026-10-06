@@ -1,18 +1,18 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use chrono::NaiveDate;
 use clap::Parser;
-use deadpool_postgres::{Config, Pool, Runtime};
 use dbgen_rs::tpch::{
-    self, batch_rows, get_comment_column, get_pk_columns, Mode, TpchBackend, TypedValue, UNIX_EPOCH,
+    self, Mode, TpchBackend, TypedValue, UNIX_EPOCH, batch_rows, get_comment_column, get_pk_columns,
 };
+use deadpool_postgres::{Config, Pool, Runtime};
 use log::info;
 use pg_bigdecimal::{BigDecimal, PgNumeric};
 use std::sync::Arc;
+use tokio_postgres::NoTls;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::{ToSql, Type};
-use tokio_postgres::NoTls;
 
 #[derive(Parser)]
 #[command(name = "pg")]
@@ -131,7 +131,11 @@ async fn binary_copy_batches(
     batches: Box<dyn Iterator<Item = RecordBatch> + Send>,
 ) -> Result<usize> {
     let client = pool.get().await?;
-    let col_names: Vec<String> = schema.fields().iter().map(|f| quote_ident(f.name())).collect();
+    let col_names: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| quote_ident(f.name()))
+        .collect();
     let types = schema_to_pg_types(schema)?;
     let stmt = format!(
         "COPY {} ({}) FROM STDIN BINARY",
@@ -165,15 +169,26 @@ fn generate_upsert_sql(target: &str, temp: &str, schema: &Schema) -> String {
     let comment = get_comment_column(target);
     let cols: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
 
-    let col_list = cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
-    let conflict_cols = pk.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+    let col_list = cols
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let conflict_cols = pk
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
     let update = cols
         .iter()
         .filter(|c| !pk.contains(*c))
         .map(|c| {
             let qc = quote_ident(c);
             if *c == comment {
-                format!("{} = LEFT(EXCLUDED.{}, 40) || ' CDC:' || NOW()::text", qc, qc)
+                format!(
+                    "{} = LEFT(EXCLUDED.{}, 40) || ' CDC:' || NOW()::text",
+                    qc, qc
+                )
             } else {
                 format!("{} = EXCLUDED.{}", qc, qc)
             }
@@ -204,7 +219,11 @@ impl TpchBackend for PostgresBackend {
 
     async fn create_table(&self, table: &str, schema: &Schema) -> Result<()> {
         let pk = get_pk_columns(table);
-        let pk_list = pk.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+        let pk_list = pk
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
         let cols: Vec<String> = schema
             .fields()
             .iter()
@@ -301,10 +320,7 @@ impl TpchBackend for PostgresBackend {
         self.pool
             .get()
             .await?
-            .execute(
-                &format!("DROP TABLE IF EXISTS {}", quote_ident(table)),
-                &[],
-            )
+            .execute(&format!("DROP TABLE IF EXISTS {}", quote_ident(table)), &[])
             .await?;
         Ok(())
     }

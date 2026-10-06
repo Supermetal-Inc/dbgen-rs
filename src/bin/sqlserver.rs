@@ -1,11 +1,11 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use clap::Parser;
-use deadpool_tiberius::{Manager, Pool};
 use dbgen_rs::tpch::{
-    self, batch_rows, get_comment_column, get_pk_columns, Mode, TpchBackend, TypedValue, UNIX_EPOCH,
+    self, Mode, TpchBackend, TypedValue, UNIX_EPOCH, batch_rows, get_comment_column, get_pk_columns,
 };
+use deadpool_tiberius::{Manager, Pool};
 use log::info;
 use std::sync::Arc;
 use tiberius::{IntoSql, TokenRow, numeric::Numeric};
@@ -119,7 +119,12 @@ fn generate_merge_sql(target: &str, temp: &str, schema: &Schema) -> String {
 
     format!(
         "MERGE {} AS T USING {} AS S ON {} WHEN MATCHED THEN UPDATE SET {} WHEN NOT MATCHED THEN INSERT ({}) VALUES ({});",
-        quote_ident(target), quote_ident(temp), join, update, ins_cols, ins_vals
+        quote_ident(target),
+        quote_ident(temp),
+        join,
+        update,
+        ins_cols,
+        ins_vals
     )
 }
 
@@ -128,10 +133,7 @@ impl TpchBackend for SqlServerBackend {
         self.pool
             .get()
             .await?
-            .execute(
-                &format!("DROP TABLE IF EXISTS {}", quote_ident(table)),
-                &[],
-            )
+            .execute(&format!("DROP TABLE IF EXISTS {}", quote_ident(table)), &[])
             .await?;
         Ok(())
     }
@@ -159,7 +161,8 @@ impl TpchBackend for SqlServerBackend {
         let qt = quote_ident(table);
         let ddl = format!(
             "IF OBJECT_ID(N'{}','U') IS NULL CREATE TABLE {} ({}, PRIMARY KEY ({}))",
-            table, qt,
+            table,
+            qt,
             cols.join(", "),
             pk_list
         );
@@ -182,10 +185,7 @@ impl TpchBackend for SqlServerBackend {
             .collect::<Result<_>>()?;
         let mut client = self.pool.get().await?;
         client
-            .execute(
-                &format!("DROP TABLE IF EXISTS {}", quote_ident(&name)),
-                &[],
-            )
+            .execute(&format!("DROP TABLE IF EXISTS {}", quote_ident(&name)), &[])
             .await?;
         client
             .execute(
@@ -248,10 +248,7 @@ impl TpchBackend for SqlServerBackend {
         self.pool
             .get()
             .await?
-            .execute(
-                &format!("TRUNCATE TABLE {}", quote_ident(table)),
-                &[],
-            )
+            .execute(&format!("TRUNCATE TABLE {}", quote_ident(table)), &[])
             .await?;
         Ok(())
     }
@@ -260,10 +257,7 @@ impl TpchBackend for SqlServerBackend {
         self.pool
             .get()
             .await?
-            .execute(
-                &format!("DROP TABLE IF EXISTS {}", quote_ident(table)),
-                &[],
-            )
+            .execute(&format!("DROP TABLE IF EXISTS {}", quote_ident(table)), &[])
             .await?;
         Ok(())
     }
@@ -271,6 +265,16 @@ impl TpchBackend for SqlServerBackend {
     fn needs_temp_for_snapshot() -> bool {
         false
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let cli = Cli::parse();
+    info!("Target: {}:{}/{}", cli.host, cli.port, cli.database);
+    let backend = Arc::new(SqlServerBackend::new(&cli)?);
+    tpch::run(backend, cli.mode).await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -296,14 +300,4 @@ mod tests {
     fn snapshots_bulk_load_directly_to_the_target() {
         assert!(!SqlServerBackend::needs_temp_for_snapshot());
     }
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let cli = Cli::parse();
-    info!("Target: {}:{}/{}", cli.host, cli.port, cli.database);
-    let backend = Arc::new(SqlServerBackend::new(&cli)?);
-    tpch::run(backend, cli.mode).await?;
-    Ok(())
 }

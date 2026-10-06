@@ -25,6 +25,7 @@ tpchgen-arrow = "2.0.2"
 clap = { version = "4.5", features = ["derive"] }
 arrow = "57.1"
 deadpool-tiberius = "0.1"
+oracle = { version = "0.6", features = ["chrono"] }
 
 [patch.crates-io]
 tiberius = { git = "https://github.com/shubhamsinha/tiberius-optimized", rev = "57b68bc9d54fa0d044d78940d97a4a243e8cdd8c" }

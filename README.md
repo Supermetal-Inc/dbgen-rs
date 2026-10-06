@@ -17,7 +17,9 @@ We benchmark snapshot (backfill) performance, which is bounded by replications t
 cargo build --release
 ```
 
-Binaries: `target/release/pg`, `target/release/sqlserver`
+Binaries: `target/release/pg`, `target/release/sqlserver`, `target/release/oracle`
+
+The Oracle binary requires the Oracle Instant Client libraries to be installed and on the linker path.
 
 ## Usage
 
@@ -30,6 +32,7 @@ Load TPC-H tables from scratch.
 ```
 pg snapshot [OPTIONS]
 sqlserver snapshot [OPTIONS]
+oracle snapshot [OPTIONS]
 ```
 
 | Flag | Default | Description |
@@ -39,7 +42,7 @@ sqlserver snapshot [OPTIONS]
 | `--drop` | `false` | Drop tables before creating |
 | `--create-only` | `false` | Create tables without loading data |
 
-Tables are loaded in parallel. PostgreSQL uses `COPY BINARY`, SQL Server uses bulk insert.
+Tables are loaded in parallel. PostgreSQL uses `COPY BINARY`, SQL Server uses bulk insert, Oracle uses array-bound batch inserts.
 
 ### CDC
 
@@ -48,6 +51,7 @@ Continuously upsert rows into existing tables.
 ```
 pg cdc [OPTIONS]
 sqlserver cdc [OPTIONS]
+oracle cdc [OPTIONS]
 ```
 
 | Flag | Default | Description |
@@ -79,6 +83,16 @@ Runs indefinitely. Each table gets a dedicated worker that upserts batches at th
 | `--database` | `supermetal` |
 | `--user` | `sa` |
 | `--password` | `p@ssword01` |
+
+**Oracle** (`oracle`)
+
+| Flag | Default |
+|------|---------|
+| `--host` | `localhost` |
+| `--port` | `1521` |
+| `--database` | `FREEPDB1` |
+| `--user` | `test` |
+| `--password` | `test` |
 
 ### Tables
 
