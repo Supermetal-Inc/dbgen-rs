@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+mysql_async = { version = "0.37.1", default-features = false, features = ["minimal-rust", "native-tls-tls"] }
 anyhow = "1.0.100"
 env_logger = "0.10.0"
 log = "0.4.20"
