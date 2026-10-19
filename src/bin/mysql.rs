@@ -268,7 +268,7 @@ impl TpchBackend for MysqlBackend {
         .await
     }
     async fn create_temp_table(&self, table: &str, schema: &Schema) -> Result<String> {
-        let name = format!("_temp_{table}_{}", std::process::id());
+        let name = format!("_temp_{table}");
         let conn = self.connection(table).await?;
         conn.lock()
             .await
@@ -326,7 +326,7 @@ impl TpchBackend for MysqlBackend {
     }
 }
 
-#[tokio::main(worker_threads = 2)]
+#[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
