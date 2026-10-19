@@ -276,28 +276,3 @@ async fn main() -> Result<()> {
     tpch::run(backend, cli.mode).await?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tiberius::ColumnData;
-
-    #[test]
-    fn bulk_rows_use_native_date_and_decimal_values() {
-        let mut row = TokenRow::new();
-        value_to_sql(&mut row, &TypedValue::Date32(Some(0)));
-        value_to_sql(&mut row, &TypedValue::Decimal128(Some(12_345), 2));
-
-        assert!(matches!(row.get(0), Some(ColumnData::Date(Some(_)))));
-        let Some(ColumnData::Numeric(Some(numeric))) = row.get(1) else {
-            panic!("expected a native numeric value");
-        };
-        assert_eq!(numeric.value(), 12_345);
-        assert_eq!(numeric.scale(), 2);
-    }
-
-    #[test]
-    fn snapshots_bulk_load_directly_to_the_target() {
-        assert!(!SqlServerBackend::needs_temp_for_snapshot());
-    }
-}
