@@ -43,7 +43,7 @@ mysql snapshot [OPTIONS]
 | `--drop` | `false` | Drop tables before creating |
 | `--create-only` | `false` | Create tables without loading data |
 
-Tables are loaded in parallel. PostgreSQL uses `COPY BINARY`, SQL Server uses bulk insert, Oracle uses array-bound batch inserts. MySQL uses parameterized multi-row inserts (up to 500 rows per statement), with exact decimal strings and InnoDB primary keys.
+Tables are loaded in parallel. PostgreSQL uses `COPY BINARY`, SQL Server uses bulk insert, Oracle uses array-bound batch inserts. MySQL streams escaped text from Arrow batches using `LOAD DATA LOCAL INFILE`, with exact decimal strings and InnoDB primary keys. `--load-method insert` selects the previous parameterized multi-row inserts (up to 500 rows per statement).
 
 ### CDC
 
@@ -105,10 +105,15 @@ Runs indefinitely. Each table gets a dedicated worker that upserts batches at th
 | `--database` | `supermetal` |
 | `--user` | `root` |
 | `--password` | `mysql` |
+| `--load-method` | `load-data` (`insert` also supported) |
 
 Create the database before running. The user needs SELECT, INSERT, UPDATE, CREATE,
 DROP and CREATE TEMPORARY TABLES privileges. The loader uses strict SQL mode and
-UTF-8 sessions. CDC staging tables are session-local and disappear on disconnect;
+UTF-8 sessions. Enable `local_infile=ON` on the server for the default loading method.
+The client streams generated data from memory; it does not read local files. Each
+Arrow batch loads in a transaction; any warnings or row-count mismatch roll it back.
+Earlier successful batches remain committed if a later batch fails. CDC staging
+tables are session-local and disappear on disconnect;
 use row-based binlogs so replication captures target-table upserts, not staging data.
 Configure the server's binlog/replication user separately in the benchmark harness.
 
@@ -134,15 +139,16 @@ eight TPC-H tables** in its selected database. Use a disposable local instance:
 ```bash
 podman run -d --name dbgen-mysql-test --cpus 2 --memory 1g \
   -p 127.0.0.1:13316:3306 -e MYSQL_ROOT_PASSWORD=mysql -e MYSQL_DATABASE=supermetal \
-  docker.io/library/mysql:8.1 --server-id=71 --log-bin=mysql-bin --binlog-format=ROW
+  docker.io/library/mysql:8.1 --local-infile=1 --server-id=71 --log-bin=mysql-bin --binlog-format=ROW
 # Wait until mysqladmin ping succeeds, then:
-MYSQL_TEST_PORT=13316 cargo test --bin mysql mysql_snapshot_and_cdc_roundtrip -- --ignored
+MYSQL_TEST_PORT=13316 cargo test --bin mysql -- --include-ignored
 podman rm -f dbgen-mysql-test
 ```
 
 The test checks empty `--create-only` tables, every generated value at SF0.01,
 composite-key upserts, insert/update branches, staging cleanup, invalid-input rejection and snapshot/CDC failure
-propagation. `MYSQL_TEST_DATABASE` and `MYSQL_TEST_PASSWORD` override test defaults.
+propagation, plus streaming escape/null/decimal/date roundtrips and rollback on
+duplicate-key or truncation warnings. `MYSQL_TEST_DATABASE` and `MYSQL_TEST_PASSWORD` override test defaults.
 
 ### Tables
 

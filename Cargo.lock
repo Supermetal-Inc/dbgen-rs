@@ -701,11 +701,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "bytes",
  "chrono",
  "clap",
  "deadpool-postgres",
  "deadpool-tiberius",
  "env_logger",
+ "futures-util",
  "log",
  "mysql_async",
  "oracle",
