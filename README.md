@@ -1,6 +1,6 @@
 # dbgen-rs
 
-TPC-H load generator. Generates data at configurable scale factors, loads via bulk protocols and batched inserts, and continuously applies CDC mutations.
+TPC-H load generator. Generates data at configurable scale factors, loads via native bulk protocols, and continuously applies CDC mutations.
 
 
 ## Why TPC-H
@@ -43,7 +43,7 @@ mysql snapshot [OPTIONS]
 | `--drop` | `false` | Drop tables before creating |
 | `--create-only` | `false` | Create tables without loading data |
 
-Tables are loaded in parallel. PostgreSQL uses `COPY BINARY`, SQL Server uses bulk insert, Oracle uses array-bound batch inserts. MySQL streams escaped text from Arrow batches using `LOAD DATA LOCAL INFILE`, with exact decimal strings and InnoDB primary keys. `--load-method insert` selects the previous parameterized multi-row inserts (up to 500 rows per statement).
+Tables are loaded in parallel. PostgreSQL uses `COPY BINARY`, SQL Server uses bulk insert, Oracle uses array-bound batch inserts, MySQL uses `LOAD DATA LOCAL INFILE`.
 
 ### CDC
 
@@ -96,7 +96,7 @@ Runs indefinitely. Each table gets a dedicated worker that upserts batches at th
 | `--user` | `test` |
 | `--password` | `test` |
 
-**MySQL** (`mysql`, tested with MySQL 8.1)
+**MySQL** (`mysql`)
 
 | Flag | Default |
 |------|---------|
@@ -105,50 +105,9 @@ Runs indefinitely. Each table gets a dedicated worker that upserts batches at th
 | `--database` | `supermetal` |
 | `--user` | `root` |
 | `--password` | `mysql` |
-| `--load-method` | `load-data` (`insert` also supported) |
+| `--load-method` | `load-data` |
 
-Create the database before running. The user needs SELECT, INSERT, UPDATE, CREATE,
-DROP and CREATE TEMPORARY TABLES privileges. The loader uses strict SQL mode and
-UTF-8 sessions. Enable `local_infile=ON` on the server for the default loading method.
-The client streams generated data from memory; it does not read local files. Each
-Arrow batch loads in a transaction; any warnings or row-count mismatch roll it back.
-Earlier successful batches remain committed if a later batch fails. CDC staging
-tables are session-local and disappear on disconnect;
-use row-based binlogs so replication captures target-table upserts, not staging data.
-Configure the server's binlog/replication user separately in the benchmark harness.
-
-```bash
-cargo build --bin mysql -j 2
-./target/debug/mysql --host 127.0.0.1 --port 3306 snapshot --scale-factor 0.01 --drop
-./target/debug/mysql --host 127.0.0.1 --port 3306 cdc --scale-factor 0.01 --rate 100
-```
-
-CDC runs until stopped. Rate is a pacing target, not a guaranteed achieved rate;
-upserts are batched and the shared timer may catch up after delays. Low total rates
-are assigned to the first selected table when there are fewer ops/sec than tables.
-Use SF0.01 or larger for all-table smoke tests: very small scales can generate
-repeated `partsupp` keys, which are rejected rather than silently discarded.
-Snapshot or CDC SQL failures return a nonzero exit status; a failed snapshot can
-leave a partial load, so use `--drop` to restart it from scratch.
-
-### MySQL verification
-
-Unit tests: `cargo test --bin mysql -j 2`. The opt-in integration test **drops all
-eight TPC-H tables** in its selected database. Use a disposable local instance:
-
-```bash
-podman run -d --name dbgen-mysql-test --cpus 2 --memory 1g \
-  -p 127.0.0.1:13316:3306 -e MYSQL_ROOT_PASSWORD=mysql -e MYSQL_DATABASE=supermetal \
-  docker.io/library/mysql:8.1 --local-infile=1 --server-id=71 --log-bin=mysql-bin --binlog-format=ROW
-# Wait until mysqladmin ping succeeds, then:
-MYSQL_TEST_PORT=13316 cargo test --bin mysql -- --include-ignored
-podman rm -f dbgen-mysql-test
-```
-
-The test checks empty `--create-only` tables, every generated value at SF0.01,
-composite-key upserts, insert/update branches, staging cleanup, invalid-input rejection and snapshot/CDC failure
-propagation, plus streaming escape/null/decimal/date roundtrips and rollback on
-duplicate-key or truncation warnings. `MYSQL_TEST_DATABASE` and `MYSQL_TEST_PASSWORD` override test defaults.
+Enable `local_infile=ON` on the MySQL server. Use `--load-method insert` for batched inserts.
 
 ### Tables
 
