@@ -105,9 +105,8 @@ Runs indefinitely. Each table gets a dedicated worker that upserts batches at th
 | `--database` | `supermetal` |
 | `--user` | `root` |
 | `--password` | `mysql` |
-| `--load-method` | `load-data` |
 
-Enable `local_infile=ON` on the MySQL server. Use `--load-method insert` for batched inserts.
+Enable `local_infile=ON` on the MySQL server.
 
 ### Tables
 

@@ -4,22 +4,15 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use bytes::Bytes;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use dbgen_rs::tpch::{
     self, Mode, TpchBackend, TypedValue, UNIX_EPOCH, batch_rows, format_decimal128,
     get_comment_column, get_pk_columns,
 };
 use futures_util::{StreamExt, stream};
-use mysql_async::{Conn, Opts, OptsBuilder, Params, TxOpts, Value, prelude::Queryable};
+use mysql_async::{Conn, Opts, OptsBuilder, TxOpts, prelude::Queryable};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
-
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
-enum LoadMethod {
-    #[default]
-    LoadData,
-    Insert,
-}
 
 #[derive(Parser)]
 #[command(name = "mysql", about = "TPC-H load generator for MySQL")]
@@ -36,15 +29,11 @@ struct Cli {
     user: String,
     #[arg(long, default_value = "mysql")]
     password: String,
-    /// Loading protocol for snapshots and CDC staging.
-    #[arg(long, value_enum, default_value = "load-data")]
-    load_method: LoadMethod,
 }
 
 type Connection = Arc<Mutex<Conn>>;
 struct MysqlBackend {
     opts: Opts,
-    load_method: LoadMethod,
     // Keep one session per table: MySQL TEMPORARY tables are session scoped.
     connections: Mutex<HashMap<String, Connection>>,
 }
@@ -64,7 +53,6 @@ impl MysqlBackend {
             ]);
         Self {
             opts: opts.into(),
-            load_method: cli.load_method,
             connections: Mutex::new(HashMap::new()),
         }
     }
@@ -148,23 +136,6 @@ fn create_sql(table: &str, schema: &Schema, primary_key: Option<&[&str]>) -> Res
         quote_ident(table),
         fields.join(", ")
     ))
-}
-
-fn value(v: &TypedValue) -> Value {
-    match v {
-        TypedValue::Int32(Some(v)) => Value::Int(*v as i64),
-        TypedValue::Int64(Some(v)) => Value::Int(*v),
-        TypedValue::Utf8(Some(v)) => Value::Bytes(v.as_bytes().to_vec()),
-        TypedValue::Date32(Some(v)) => Value::Bytes(
-            (UNIX_EPOCH + chrono::Duration::days(*v as i64))
-                .to_string()
-                .into_bytes(),
-        ),
-        TypedValue::Decimal128(Some(v), scale) => {
-            Value::Bytes(format_decimal128(*v, *scale).into_bytes())
-        }
-        _ => Value::NULL,
-    }
 }
 
 // LOAD DATA's escaping is distinct from SQL string escaping. In particular,
@@ -254,16 +225,6 @@ async fn load_batch(conn: &mut Conn, sql: &str, batch: RecordBatch) -> Result<us
     Ok(expected)
 }
 
-fn insert_sql(table: &str, schema: &Schema, rows: usize) -> String {
-    let row = format!("({})", vec!["?"; schema.fields().len()].join(","));
-    format!(
-        "INSERT INTO {} ({}) VALUES {}",
-        quote_ident(table),
-        columns(schema),
-        vec![row; rows].join(",")
-    )
-}
-
 fn upsert_sql(target: &str, temp: &str, schema: &Schema) -> String {
     let pk = get_pk_columns(target);
     let comment = get_comment_column(target);
@@ -324,38 +285,10 @@ impl TpchBackend for MysqlBackend {
     ) -> Result<usize> {
         let conn = self.connection(table).await?;
         let mut conn = conn.lock().await;
-        if matches!(self.load_method, LoadMethod::LoadData) {
-            let sql = load_sql(table, schema);
-            let mut total = 0;
-            for batch in batches {
-                total += load_batch(&mut conn, &sql, batch).await?;
-            }
-            return Ok(total);
-        }
-        // Bound packet size and parameter count; don't issue one round trip per row.
-        const ROWS: usize = 500;
-        let sql = insert_sql(table, schema, ROWS);
+        let sql = load_sql(table, schema);
         let mut total = 0;
-        let mut row = Vec::new();
         for batch in batches {
-            let mut iter = batch_rows(&batch)?;
-            let mut params = Vec::with_capacity(ROWS * schema.fields().len());
-            let mut count = 0;
-            while iter.next_into(&mut row) {
-                params.extend(row.iter().map(value));
-                count += 1;
-                if count == ROWS {
-                    conn.exec_drop(&sql, Params::Positional(std::mem::take(&mut params)))
-                        .await?;
-                    total += count;
-                    count = 0;
-                }
-            }
-            if count > 0 {
-                conn.exec_drop(insert_sql(table, schema, count), Params::Positional(params))
-                    .await?;
-                total += count;
-            }
+            total += load_batch(&mut conn, &sql, batch).await?;
         }
         Ok(total)
     }
