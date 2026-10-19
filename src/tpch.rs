@@ -10,7 +10,7 @@ use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use chrono::NaiveDate;
 use clap::{Args, Subcommand};
-use log::{error, info};
+use log::info;
 use tokio::task::JoinSet;
 use tpchgen::generators::{
     CustomerGenerator, LineItemGenerator, NationGenerator, OrderGenerator, PartGenerator,
@@ -346,6 +346,16 @@ pub trait TpchBackend: Send + Sync + 'static {
 }
 
 pub async fn run<B: TpchBackend>(backend: Arc<B>, mode: Mode) -> Result<()> {
+    let sf = match &mode {
+        Mode::Snapshot(a) => a.scale_factor,
+        Mode::Cdc(a) => a.scale_factor,
+    };
+    if !sf.is_finite() || sf <= 0.0 {
+        bail!("scale factor must be finite and positive");
+    }
+    if matches!(&mode, Mode::Cdc(a) if a.rate == 0) {
+        bail!("CDC rate must be positive");
+    }
     match mode {
         Mode::Snapshot(args) => run_snapshot(backend, args).await,
         Mode::Cdc(args) => run_cdc(backend, args).await,
@@ -397,7 +407,7 @@ async fn run_snapshot<B: TpchBackend>(backend: Arc<B>, args: SnapshotArgs) -> Re
     while let Some(result) = set.join_next().await {
         match result? {
             Ok((table, rows)) => info!("[{}]: loaded {} rows", table, rows),
-            Err(e) => error!("Error: {}", e),
+            Err(e) => return Err(e),
         }
     }
 
@@ -459,6 +469,9 @@ async fn run_cdc<B: TpchBackend>(backend: Arc<B>, args: CdcArgs) -> Result<()> {
         } else {
             rate_per_table
         };
+        if rate == 0 {
+            continue;
+        }
         let task = async move { cdc_worker::<B>(backend, table, rate, sf, total_ops, start).await };
         if B::is_blocking() {
             let handle = handle.clone();
@@ -518,8 +531,7 @@ async fn cdc_worker<B: TpchBackend>(
 
         let rows = batch.num_rows();
         if let Err(e) = cdc_batch::<B>(&backend, &table, &temp, &schema, batch).await {
-            error!("[{}]: CDC error: {}", table, e);
-            continue;
+            return Err(e).with_context(|| format!("[{table}]: CDC batch failed"));
         }
 
         let ops =
