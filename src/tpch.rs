@@ -206,10 +206,10 @@ impl Iterator for TpchTable {
 }
 
 #[derive(Debug)]
-pub enum TypedValue {
+pub enum TypedValue<'a> {
     Int32(Option<i32>),
     Int64(Option<i64>),
-    Utf8(Option<String>),
+    Utf8(Option<&'a str>),
     Date32(Option<i32>),
     Decimal128(Option<i128>, i8),
 }
@@ -223,15 +223,13 @@ enum TypedArray<'a> {
     Decimal128(&'a Decimal128Array, i8),
 }
 
-impl TypedArray<'_> {
-    fn value_at(&self, idx: usize) -> TypedValue {
+impl<'a> TypedArray<'a> {
+    fn value_at(&self, idx: usize) -> TypedValue<'a> {
         match self {
             TypedArray::Int32(a) => TypedValue::Int32((!a.is_null(idx)).then(|| a.value(idx))),
             TypedArray::Int64(a) => TypedValue::Int64((!a.is_null(idx)).then(|| a.value(idx))),
-            TypedArray::Utf8(a) => TypedValue::Utf8((!a.is_null(idx)).then(|| a.value(idx).into())),
-            TypedArray::Utf8View(a) => {
-                TypedValue::Utf8((!a.is_null(idx)).then(|| a.value(idx).into()))
-            }
+            TypedArray::Utf8(a) => TypedValue::Utf8((!a.is_null(idx)).then(|| a.value(idx))),
+            TypedArray::Utf8View(a) => TypedValue::Utf8((!a.is_null(idx)).then(|| a.value(idx))),
             TypedArray::Date32(a) => TypedValue::Date32((!a.is_null(idx)).then(|| a.value(idx))),
             TypedArray::Decimal128(a, s) => {
                 TypedValue::Decimal128((!a.is_null(idx)).then(|| a.value(idx)), *s)
@@ -246,8 +244,8 @@ pub struct BatchRowIter<'a> {
     num_rows: usize,
 }
 
-impl BatchRowIter<'_> {
-    pub fn next_into(&mut self, row: &mut Vec<TypedValue>) -> bool {
+impl<'a> BatchRowIter<'a> {
+    pub fn next_into(&mut self, row: &mut Vec<TypedValue<'a>>) -> bool {
         if self.row_idx >= self.num_rows {
             return false;
         }

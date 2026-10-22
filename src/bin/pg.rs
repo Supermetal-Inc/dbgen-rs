@@ -88,8 +88,8 @@ fn schema_to_pg_types(schema: &Schema) -> Result<Vec<Type>> {
 }
 
 /// Concrete typed value for PostgreSQL. Avoids a Box<dyn ToSql> allocation per
-/// cell by holding the PG-ready value inline and delegating via `as_to_sql`.
-/// Borrows strings from the source TypedValue to avoid cloning.
+/// cell by holding the PG-ready value inline and delegating via `pg_as_to_sql`.
+/// Borrows strings from Arrow storage through TypedValue.
 enum PgValue<'a> {
     I32(Option<i32>),
     I64(Option<i64>),
@@ -98,23 +98,21 @@ enum PgValue<'a> {
     Numeric(PgNumeric),
 }
 
-impl PgValue<'_> {
-    fn as_to_sql(&self) -> &(dyn ToSql + Sync) {
-        match self {
-            PgValue::I32(v) => v,
-            PgValue::I64(v) => v,
-            PgValue::Str(v) => v,
-            PgValue::Date(v) => v,
-            PgValue::Numeric(v) => v,
-        }
+fn pg_as_to_sql<'r, 'v>(value: &'r PgValue<'v>) -> &'r (dyn ToSql + Sync) {
+    match value {
+        PgValue::I32(v) => v,
+        PgValue::I64(v) => v,
+        PgValue::Str(v) => v,
+        PgValue::Date(v) => v,
+        PgValue::Numeric(v) => v,
     }
 }
 
-fn typed_value_to_pg<'a>(val: &'a TypedValue) -> PgValue<'a> {
+fn typed_value_to_pg<'a>(val: &TypedValue<'a>) -> PgValue<'a> {
     match val {
         TypedValue::Int32(v) => PgValue::I32(*v),
         TypedValue::Int64(v) => PgValue::I64(*v),
-        TypedValue::Utf8(v) => PgValue::Str(v.as_deref()),
+        TypedValue::Utf8(v) => PgValue::Str(*v),
         TypedValue::Date32(v) => {
             PgValue::Date(v.map(|days| UNIX_EPOCH + chrono::Duration::days(days as i64)))
         }
@@ -147,15 +145,19 @@ async fn binary_copy_batches(
     let writer = BinaryCopyInWriter::new(sink, &types);
     tokio::pin!(writer);
 
-    let mut vals = Vec::with_capacity(schema.fields().len());
     let mut total = 0;
 
     for batch in batches {
         let mut iter = batch_rows(&batch)?;
+        let mut vals = Vec::with_capacity(batch.num_columns());
+        let mut row = Vec::with_capacity(batch.num_columns());
         while iter.next_into(&mut vals) {
-            let row: Vec<PgValue<'_>> = vals.iter().map(typed_value_to_pg).collect();
-            let refs: Vec<&(dyn ToSql + Sync)> = row.iter().map(PgValue::as_to_sql).collect();
-            writer.as_mut().write(&refs).await?;
+            row.clear();
+            row.extend(vals.iter().map(typed_value_to_pg));
+            writer
+                .as_mut()
+                .write_raw(row.iter().map(pg_as_to_sql))
+                .await?;
         }
         total += batch.num_rows();
     }

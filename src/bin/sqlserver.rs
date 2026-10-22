@@ -55,7 +55,7 @@ fn value_to_sql(row: &mut TokenRow<'static>, val: &TypedValue) {
     match val {
         TypedValue::Int32(v) => row.push(v.into_sql()),
         TypedValue::Int64(v) => row.push(v.into_sql()),
-        TypedValue::Utf8(v) => row.push(v.clone().into_sql()),
+        TypedValue::Utf8(v) => row.push(v.map(str::to_owned).into_sql()),
         TypedValue::Date32(v) => {
             let date = v.map(|days| UNIX_EPOCH + chrono::Duration::days(days as i64));
             row.push(date.into_sql());
@@ -204,9 +204,9 @@ impl TpchBackend for SqlServerBackend {
     ) -> Result<usize> {
         let mut client = self.pool.get().await?;
         let mut total = 0;
-        let mut vals = Vec::new();
         for batch in batches {
             let mut iter = batch_rows(&batch)?;
+            let mut vals = Vec::with_capacity(batch.num_columns());
             let mut req = client.bulk_insert(table).await?;
             while iter.next_into(&mut vals) {
                 let mut row = TokenRow::with_capacity(vals.len());

@@ -88,11 +88,11 @@ impl OraValue<'_> {
     }
 }
 
-fn typed_value_to_ora(val: &TypedValue) -> OraValue<'_> {
+fn typed_value_to_ora<'a>(val: &TypedValue<'a>) -> OraValue<'a> {
     match val {
         TypedValue::Int32(v) => OraValue::I32(*v),
         TypedValue::Int64(v) => OraValue::I64(*v),
-        TypedValue::Utf8(v) => OraValue::Str(v.as_deref()),
+        TypedValue::Utf8(v) => OraValue::Str(*v),
         TypedValue::Date32(v) => {
             OraValue::Date(v.map(|days| UNIX_EPOCH + chrono::Duration::days(days as i64)))
         }
@@ -178,14 +178,15 @@ fn bulk_insert_sync(
 
     let mut batch = conn.batch(&sql, 10000).build()?;
     let mut total = 0;
-    let mut vals = Vec::with_capacity(schema.fields().len());
 
     for rb in batches {
         let mut iter = batch_rows(&rb)?;
+        let mut vals = Vec::with_capacity(rb.num_columns());
         while iter.next_into(&mut vals) {
-            let ora_vals: Vec<OraValue> = vals.iter().map(typed_value_to_ora).collect();
-            let refs: Vec<&dyn ToSql> = ora_vals.iter().map(OraValue::as_to_sql).collect();
-            batch.append_row(&refs)?;
+            for (index, val) in vals.iter().enumerate() {
+                batch.set(index + 1, typed_value_to_ora(val).as_to_sql())?;
+            }
+            batch.append_row(&[])?;
         }
         total += rb.num_rows();
     }
