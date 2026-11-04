@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
+use crate::nested::NestedShape;
 use anyhow::{Context, Result, bail};
 use arrow::array::{
     Array, Date32Array, Decimal128Array, Int32Array, Int64Array, StringArray, StringViewArray,
@@ -107,6 +108,9 @@ pub struct SnapshotArgs {
     pub drop: bool,
     #[arg(long, default_value_t = false)]
     pub create_only: bool,
+    /// Store most lineitem columns in one JSON column. Only PostgreSQL supports this
+    #[arg(long, default_value_t = false)]
+    pub nested: bool,
 }
 
 #[derive(Args, Clone)]
@@ -117,6 +121,9 @@ pub struct CdcArgs {
     pub rate: usize,
     #[arg(long, default_value_t = 1.0)]
     pub scale_factor: f64,
+    /// Must match the --nested value used for the snapshot
+    #[arg(long, default_value_t = false)]
+    pub nested: bool,
 }
 
 pub enum TpchTable {
@@ -202,6 +209,52 @@ impl Iterator for TpchTable {
             TpchTable::Orders(g) => g.next(),
             TpchTable::LineItem(g) => g.next(),
         }
+    }
+}
+
+pub struct TableSource {
+    table: TpchTable,
+    nested: Option<NestedShape>,
+}
+
+impl TableSource {
+    pub fn new(name: &str, scale_factor: f64, nested: bool) -> Result<Self> {
+        let table = TpchTable::new(name, scale_factor)?;
+        let nested = if nested {
+            NestedShape::new(name, &table.schema())
+        } else {
+            None
+        };
+        Ok(Self { table, nested })
+    }
+
+    pub fn schema(&self) -> Arc<Schema> {
+        match &self.nested {
+            Some(shape) => shape.schema(),
+            None => self.table.schema(),
+        }
+    }
+
+    pub fn with_batch_size(self, batch_size: usize) -> Self {
+        Self {
+            table: self.table.with_batch_size(batch_size),
+            nested: self.nested,
+        }
+    }
+}
+
+impl Iterator for TableSource {
+    type Item = RecordBatch;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let batch = self.table.next()?;
+        Some(match &self.nested {
+            // The shape is fixed per table, so a failure here is a bug in NestedShape.
+            Some(shape) => shape
+                .apply(&batch)
+                .expect("nested shape encodes TPC-H batch"),
+            None => batch,
+        })
     }
 }
 
@@ -341,6 +394,10 @@ pub trait TpchBackend: Send + Sync + 'static {
     fn is_blocking() -> bool {
         false
     }
+
+    fn supports_nested() -> bool {
+        false
+    }
 }
 
 pub async fn run<B: TpchBackend>(backend: Arc<B>, mode: Mode) -> Result<()> {
@@ -353,6 +410,13 @@ pub async fn run<B: TpchBackend>(backend: Arc<B>, mode: Mode) -> Result<()> {
     }
     if matches!(&mode, Mode::Cdc(a) if a.rate == 0) {
         bail!("CDC rate must be positive");
+    }
+    let nested = match &mode {
+        Mode::Snapshot(a) => a.nested,
+        Mode::Cdc(a) => a.nested,
+    };
+    if nested && !B::supports_nested() {
+        bail!("--nested is not supported for this database");
     }
     match mode {
         Mode::Snapshot(args) => run_snapshot(backend, args).await,
@@ -375,7 +439,7 @@ async fn run_snapshot<B: TpchBackend>(backend: Arc<B>, args: SnapshotArgs) -> Re
     }
 
     for table in &tables {
-        let schema = TpchTable::new(table, args.scale_factor)?.schema();
+        let schema = TableSource::new(table, args.scale_factor, args.nested)?.schema();
         info!("Creating [{}]...", table);
         backend.create_table(table, &schema).await?;
     }
@@ -390,8 +454,9 @@ async fn run_snapshot<B: TpchBackend>(backend: Arc<B>, args: SnapshotArgs) -> Re
     for table in tables {
         let backend = Arc::clone(&backend);
         let sf = args.scale_factor;
+        let nested = args.nested;
         let task = async move {
-            let n = load_table_snapshot::<B>(backend, table.clone(), sf).await?;
+            let n = load_table_snapshot::<B>(backend, table.clone(), sf, nested).await?;
             Ok::<_, anyhow::Error>((table, n))
         };
         if B::is_blocking() {
@@ -417,8 +482,9 @@ async fn load_table_snapshot<B: TpchBackend>(
     backend: Arc<B>,
     table: String,
     scale_factor: f64,
+    nested: bool,
 ) -> Result<usize> {
-    let tpch = TpchTable::new(&table, scale_factor)?.with_batch_size(100_000);
+    let tpch = TableSource::new(&table, scale_factor, nested)?.with_batch_size(100_000);
     let schema = tpch.schema();
 
     let target = if B::needs_temp_for_snapshot() {
@@ -461,6 +527,7 @@ async fn run_cdc<B: TpchBackend>(backend: Arc<B>, args: CdcArgs) -> Result<()> {
         let backend = Arc::clone(&backend);
         let total_ops = Arc::clone(&total_ops);
         let sf = args.scale_factor;
+        let nested = args.nested;
         let table = table.clone();
         let rate = if i == 0 {
             args.rate - rate_per_table * (n - 1)
@@ -470,7 +537,9 @@ async fn run_cdc<B: TpchBackend>(backend: Arc<B>, args: CdcArgs) -> Result<()> {
         if rate == 0 {
             continue;
         }
-        let task = async move { cdc_worker::<B>(backend, table, rate, sf, total_ops, start).await };
+        let task = async move {
+            cdc_worker::<B>(backend, table, rate, sf, nested, total_ops, start).await
+        };
         if B::is_blocking() {
             let handle = handle.clone();
             set.spawn_blocking(move || handle.block_on(task));
@@ -490,6 +559,7 @@ async fn cdc_worker<B: TpchBackend>(
     table: String,
     rate: usize,
     scale_factor: f64,
+    nested: bool,
     total_ops: Arc<AtomicU64>,
     start: std::time::Instant,
 ) -> Result<()> {
@@ -497,7 +567,7 @@ async fn cdc_worker<B: TpchBackend>(
     let interval = Duration::from_secs_f64(batch_size as f64 / rate as f64);
     let mut timer = tokio::time::interval(interval);
 
-    let mut source = TpchTable::new(&table, scale_factor)?.with_batch_size(batch_size);
+    let mut source = TableSource::new(&table, scale_factor, nested)?.with_batch_size(batch_size);
     let schema = source.schema();
     let temp = backend.create_temp_table(&table, &schema).await?;
 
@@ -515,7 +585,8 @@ async fn cdc_worker<B: TpchBackend>(
         let batch = match source.next() {
             Some(b) => b,
             None => {
-                source = TpchTable::new(&table, scale_factor)?.with_batch_size(batch_size);
+                source =
+                    TableSource::new(&table, scale_factor, nested)?.with_batch_size(batch_size);
                 match source.next() {
                     Some(b) => b,
                     None => bail!(

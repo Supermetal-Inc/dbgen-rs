@@ -27,6 +27,7 @@ tpchgen = "2.0.2"
 tpchgen-arrow = "2.0.2"
 clap = { version = "4.5", features = ["derive"] }
 arrow = "57.1"
+arrow-schema = { version = "57.1", features = ["canonical_extension_types"] }
 deadpool-tiberius = "0.1"
 oracle = { version = "0.6", features = ["chrono"] }
 
