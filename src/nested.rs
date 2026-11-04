@@ -6,9 +6,7 @@ use anyhow::{Context, Result};
 use arrow::array::{ArrayRef, RecordBatch, StringBuilder, StructArray};
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use arrow::json::writer::{EncoderOptions, make_encoder};
-
-const EXTENSION_NAME_KEY: &str = "ARROW:extension:name";
-const JSON_EXTENSION: &str = "arrow.json";
+use arrow_schema::extension::Json;
 
 // Comet keeps its join keys and its partition column `l_shipdate` as plain columns.
 // `l_linenumber` also stays because CDC upserts on the primary key.
@@ -22,7 +20,7 @@ const LINEITEM_TOP_LEVEL: &[&str] = &[
 const LINEITEM_DATA: &str = "lineitem_data";
 
 pub fn is_json(field: &Field) -> bool {
-    field.metadata().get(EXTENSION_NAME_KEY).map(String::as_str) == Some(JSON_EXTENSION)
+    field.try_extension_type::<Json>().is_ok()
 }
 
 /// Moves the other columns into one JSON column. Each value is an array with
@@ -53,9 +51,7 @@ impl NestedShape {
             .map(|&i| flat.fields()[i].clone())
             .collect();
         fields.push(Arc::new(
-            Field::new(LINEITEM_DATA, DataType::Utf8, false).with_metadata(
-                [(EXTENSION_NAME_KEY.to_string(), JSON_EXTENSION.to_string())].into(),
-            ),
+            Field::new(LINEITEM_DATA, DataType::Utf8, false).with_extension_type(Json::default()),
         ));
 
         Some(Self {
