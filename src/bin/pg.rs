@@ -1,18 +1,21 @@
 use anyhow::{Result, bail};
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use bytes::{BufMut, BytesMut};
 use chrono::NaiveDate;
 use clap::Parser;
+use dbgen_rs::nested::is_json;
 use dbgen_rs::tpch::{
     self, Mode, TpchBackend, TypedValue, UNIX_EPOCH, batch_rows, get_comment_column, get_pk_columns,
 };
 use deadpool_postgres::{Config, Pool, Runtime};
 use log::info;
 use pg_bigdecimal::{BigDecimal, PgNumeric};
+use std::error::Error;
 use std::sync::Arc;
 use tokio_postgres::NoTls;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
-use tokio_postgres::types::{ToSql, Type};
+use tokio_postgres::types::{IsNull, ToSql, Type, accepts, to_sql_checked};
 
 #[derive(Parser)]
 #[command(name = "pg")]
@@ -53,8 +56,11 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn arrow_type_to_sql(dt: &DataType) -> Result<String> {
-    Ok(match dt {
+fn arrow_type_to_sql(field: &Field) -> Result<String> {
+    if is_json(field) {
+        return Ok("JSONB".into());
+    }
+    Ok(match field.data_type() {
         DataType::Int32 => "INTEGER".into(),
         DataType::Int64 => "BIGINT".into(),
         DataType::Float32 => "REAL".into(),
@@ -62,12 +68,18 @@ fn arrow_type_to_sql(dt: &DataType) -> Result<String> {
         DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => "TEXT".into(),
         DataType::Date32 => "DATE".into(),
         DataType::Decimal128(p, s) => format!("NUMERIC({},{})", p, s),
-        _ => bail!("unsupported Arrow type for PostgreSQL: {:?}", dt),
+        _ => bail!(
+            "unsupported Arrow type for PostgreSQL: {:?}",
+            field.data_type()
+        ),
     })
 }
 
-fn arrow_type_to_pg_type(dt: &DataType) -> Result<Type> {
-    Ok(match dt {
+fn arrow_type_to_pg_type(field: &Field) -> Result<Type> {
+    if is_json(field) {
+        return Ok(Type::JSONB);
+    }
+    Ok(match field.data_type() {
         DataType::Int32 => Type::INT4,
         DataType::Int64 => Type::INT8,
         DataType::Float32 => Type::FLOAT4,
@@ -75,7 +87,10 @@ fn arrow_type_to_pg_type(dt: &DataType) -> Result<Type> {
         DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8 => Type::TEXT,
         DataType::Date32 => Type::DATE,
         DataType::Decimal128(_, _) => Type::NUMERIC,
-        _ => bail!("unsupported Arrow type for PostgreSQL: {:?}", dt),
+        _ => bail!(
+            "unsupported Arrow type for PostgreSQL: {:?}",
+            field.data_type()
+        ),
     })
 }
 
@@ -83,7 +98,7 @@ fn schema_to_pg_types(schema: &Schema) -> Result<Vec<Type>> {
     schema
         .fields()
         .iter()
-        .map(|f| arrow_type_to_pg_type(f.data_type()))
+        .map(|f| arrow_type_to_pg_type(f))
         .collect()
 }
 
@@ -96,6 +111,27 @@ enum PgValue<'a> {
     Str(Option<&'a str>),
     Date(Option<NaiveDate>),
     Numeric(PgNumeric),
+    Jsonb(Option<Jsonb<'a>>),
+}
+
+/// JSON text sent as binary `jsonb`, which `&str` does not accept.
+#[derive(Debug)]
+struct Jsonb<'a>(&'a str);
+
+impl ToSql for Jsonb<'_> {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        // jsonb binary format version
+        out.put_u8(1);
+        out.put_slice(self.0.as_bytes());
+        Ok(IsNull::No)
+    }
+
+    accepts!(JSONB);
+    to_sql_checked!();
 }
 
 fn pg_as_to_sql<'r, 'v>(value: &'r PgValue<'v>) -> &'r (dyn ToSql + Sync) {
@@ -105,13 +141,15 @@ fn pg_as_to_sql<'r, 'v>(value: &'r PgValue<'v>) -> &'r (dyn ToSql + Sync) {
         PgValue::Str(v) => v,
         PgValue::Date(v) => v,
         PgValue::Numeric(v) => v,
+        PgValue::Jsonb(v) => v,
     }
 }
 
-fn typed_value_to_pg<'a>(val: &TypedValue<'a>) -> PgValue<'a> {
+fn typed_value_to_pg<'a>(val: &TypedValue<'a>, ty: &Type) -> PgValue<'a> {
     match val {
         TypedValue::Int32(v) => PgValue::I32(*v),
         TypedValue::Int64(v) => PgValue::I64(*v),
+        TypedValue::Utf8(v) if *ty == Type::JSONB => PgValue::Jsonb(v.map(Jsonb)),
         TypedValue::Utf8(v) => PgValue::Str(*v),
         TypedValue::Date32(v) => {
             PgValue::Date(v.map(|days| UNIX_EPOCH + chrono::Duration::days(days as i64)))
@@ -153,7 +191,11 @@ async fn binary_copy_batches(
         let mut row = Vec::with_capacity(batch.num_columns());
         while iter.next_into(&mut vals) {
             row.clear();
-            row.extend(vals.iter().map(typed_value_to_pg));
+            row.extend(
+                vals.iter()
+                    .zip(&types)
+                    .map(|(v, ty)| typed_value_to_pg(v, ty)),
+            );
             writer
                 .as_mut()
                 .write_raw(row.iter().map(pg_as_to_sql))
@@ -181,15 +223,23 @@ fn generate_upsert_sql(target: &str, temp: &str, schema: &Schema) -> String {
         .map(|c| quote_ident(c))
         .collect::<Vec<_>>()
         .join(", ");
-    let update = cols
+    let update = schema
+        .fields()
         .iter()
-        .filter(|c| !pk.contains(*c))
-        .map(|c| {
+        .filter(|f| !pk.contains(&f.name().as_str()))
+        .map(|f| {
+            let c = f.name().as_str();
             let qc = quote_ident(c);
-            if *c == comment {
+            if c == comment {
                 format!(
                     "{} = LEFT(EXCLUDED.{}, 40) || ' CDC:' || NOW()::text",
                     qc, qc
+                )
+            } else if is_json(f) {
+                // The nested shape keeps the comment inside the single array element.
+                format!(
+                    "{qc} = jsonb_set(EXCLUDED.{qc}, '{{0,{comment}}}', \
+                     to_jsonb(LEFT(EXCLUDED.{qc} -> 0 ->> '{comment}', 40) || ' CDC:' || NOW()::text))"
                 )
             } else {
                 format!("{} = EXCLUDED.{}", qc, qc)
@@ -234,7 +284,7 @@ impl TpchBackend for PostgresBackend {
                 Ok(format!(
                     "{} {}{}",
                     quote_ident(f.name()),
-                    arrow_type_to_sql(f.data_type())?,
+                    arrow_type_to_sql(f)?,
                     null
                 ))
             })
@@ -259,7 +309,7 @@ impl TpchBackend for PostgresBackend {
                 Ok(format!(
                     "{} {}",
                     quote_ident(f.name()),
-                    arrow_type_to_sql(f.data_type())?
+                    arrow_type_to_sql(f)?
                 ))
             })
             .collect::<Result<_>>()?;
@@ -329,6 +379,10 @@ impl TpchBackend for PostgresBackend {
 
     fn needs_temp_for_snapshot() -> bool {
         false
+    }
+
+    fn supports_nested() -> bool {
+        true
     }
 }
 
