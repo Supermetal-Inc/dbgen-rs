@@ -43,8 +43,27 @@ mysql snapshot [OPTIONS]
 | `--drop` | `false` | Drop tables before creating |
 | `--create-only` | `false` | Create tables without loading data |
 | `--nested` | `false` | Load `lineitem` in the nested shape (PostgreSQL only) |
+| `--workers` | `8` | Shared snapshot writer count |
+| `--commit-rows` | `100000` | Maximum rows per snapshot transaction |
 
 Tables are loaded in parallel. PostgreSQL uses `COPY BINARY`, SQL Server uses bulk insert, Oracle uses array-bound batch inserts, MySQL uses `LOAD DATA LOCAL INFILE`.
+
+Snapshots default to 8 shared workers and at most 100,000 rows per commit:
+
+```sh
+oracle snapshot --scale-factor 1 --workers 8 --commit-rows 100000
+```
+
+Workers share chunks across tables, including the final large table. At most one
+Arrow chunk per worker is resident, plus generator and driver buffers; generation
+is serialized and overlaps writes. Connections and commits remain backend-specific.
+
+Progress logs every five seconds distinguish generated rows, successfully written
+batches, and acknowledged committed rows. Written rows can later roll back;
+a failed commit response has an unknown outcome. Errors and Ctrl-C stop new work
+and wait for active database calls, rolling back unfinished chunks. Earlier commits
+remain: this is **not an atomic snapshot or a resumable load**. Recreate the selected
+tables before retrying, for example with `--drop` on a disposable target. CDC is unchanged.
 
 ### CDC
 

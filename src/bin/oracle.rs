@@ -161,7 +161,11 @@ fn bulk_insert_sync(
     conn: &oracle::Connection,
     table: &str,
     schema: &Schema,
-    batches: Box<dyn Iterator<Item = RecordBatch> + Send>,
+    batches: impl Iterator<Item = RecordBatch> + Send,
+    snapshot: Option<(
+        &dbgen_rs::snapshot::Progress,
+        &tokio_util::sync::CancellationToken,
+    )>,
 ) -> Result<usize> {
     let cols: Vec<String> = schema
         .fields()
@@ -176,23 +180,57 @@ fn bulk_insert_sync(
         placeholders.join(", ")
     );
 
-    let mut batch = conn.batch(&sql, 10000).build()?;
+    let array_rows = 10_000;
+    let mut batch = conn.batch(&sql, array_rows).build()?;
     let mut total = 0;
+    let mut pending = 0;
+    let check_cancel = || -> Result<()> {
+        if snapshot.is_some_and(|(_, token)| token.is_cancelled()) {
+            bail!("snapshot cancelled");
+        }
+        Ok(())
+    };
+    check_cancel()?;
 
     for rb in batches {
         let mut iter = batch_rows(&rb)?;
         let mut vals = Vec::with_capacity(rb.num_columns());
         while iter.next_into(&mut vals) {
+            if pending == 0 {
+                check_cancel()?;
+            }
             for (index, val) in vals.iter().enumerate() {
                 batch.set(index + 1, typed_value_to_ora(val).as_to_sql())?;
             }
             batch.append_row(&[])?;
+            pending += 1;
+            if let Some((progress, _)) = snapshot
+                && pending == array_rows as u64
+            {
+                // append_row executes a full array batch automatically.
+                progress
+                    .written
+                    .fetch_add(pending, std::sync::atomic::Ordering::Relaxed);
+                pending = 0;
+            }
         }
         total += rb.num_rows();
     }
 
+    check_cancel()?;
     batch.execute()?;
+    if let Some((progress, _)) = snapshot {
+        progress
+            .written
+            .fetch_add(pending, std::sync::atomic::Ordering::Relaxed);
+    }
+    check_cancel()?;
     conn.commit()?;
+    if let Some((progress, _)) = snapshot {
+        progress
+            .committed
+            .fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(total)
 }
 
@@ -271,27 +309,7 @@ impl TpchBackend for OracleBackend {
         batches: Box<dyn Iterator<Item = RecordBatch> + Send>,
     ) -> Result<usize> {
         let conn = self.pool.get()?;
-        bulk_insert_sync(&conn, table, schema, batches)
-    }
-
-    async fn copy_temp_to_target(&self, target: &str, temp: &str, schema: &Schema) -> Result<()> {
-        let conn = self.pool.get()?;
-        let cols = schema
-            .fields()
-            .iter()
-            .map(|f| quote_ident(f.name()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO {} ({}) SELECT {} FROM {}",
-            quote_ident(target),
-            cols,
-            cols,
-            quote_ident(temp)
-        );
-        conn.execute(&sql, &[])?;
-        conn.commit()?;
-        Ok(())
+        bulk_insert_sync(&conn, table, schema, batches, None)
     }
 
     async fn upsert_from_temp(&self, target: &str, temp: &str, schema: &Schema) -> Result<()> {
@@ -313,8 +331,32 @@ impl TpchBackend for OracleBackend {
         drop_table_sync(&conn, table)
     }
 
-    fn needs_temp_for_snapshot() -> bool {
-        false
+    async fn write_snapshot_chunk(
+        &self,
+        table: String,
+        batch: RecordBatch,
+        progress: Arc<dbgen_rs::snapshot::Progress>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool.get()?;
+            let schema = batch.schema();
+            let result = bulk_insert_sync(
+                &conn,
+                &table,
+                &schema,
+                std::iter::once(batch),
+                Some((&progress, &cancel)),
+            );
+            if result.is_err() {
+                // Preserve the original write/commit error. A failed commit reply may
+                // still mean the server committed; never retry automatically.
+                let _ = conn.rollback();
+            }
+            result.map(|_| ())
+        })
+        .await?
     }
 
     fn is_blocking() -> bool {
@@ -332,11 +374,122 @@ async fn main() -> Result<()> {
     // OCI installs its own SIGINT handler during init and doesn't restore it
     // (https://github.com/kubo/rust-oracle/issues/37). Install ours after the
     // pool is built so it overrides OCI's via sigaction.
-    tokio::spawn(async {
-        let _ = tokio::signal::ctrl_c().await;
-        std::process::exit(130);
-    });
+    if matches!(&cli.mode, Mode::Cdc(_)) {
+        tokio::spawn(async {
+            let _ = tokio::signal::ctrl_c().await;
+            std::process::exit(130);
+        });
+    }
 
     tpch::run(backend, cli.mode).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::Int32Array;
+    use arrow::datatypes::Field;
+    use dbgen_rs::snapshot::{self, Progress};
+    use std::sync::atomic::Ordering;
+    use tokio_util::sync::CancellationToken;
+
+    // Explicit opt-in only; use a dedicated test database, never a benchmark source.
+    #[tokio::test]
+    #[ignore = "requires TEST_ORACLE_CONNECT_STRING, TEST_ORACLE_USER, TEST_ORACLE_PASSWORD"]
+    async fn snapshot_chunk_commits_and_rollback() -> Result<()> {
+        let pool = PoolBuilder::new(
+            std::env::var("TEST_ORACLE_USER")?,
+            std::env::var("TEST_ORACLE_PASSWORD")?,
+            std::env::var("TEST_ORACLE_CONNECT_STRING")?,
+        )
+        .max_connections(4)
+        .get_mode(GetMode::Wait)
+        .build()?;
+        let backend = Arc::new(OracleBackend {
+            pool: Arc::new(pool),
+        });
+        let conn = backend.pool.get()?;
+        let table = format!(
+            "dbgen_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis()
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        create_table_sync(&conn, &table, &schema, Some(&["id"]))?;
+        let make_batch = |values: Vec<i32>| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap()
+        };
+        let progress = Arc::new(Progress::default());
+        let result: Result<()> = async {
+            let batches = vec![
+                make_batch((0..10003).collect()),
+                make_batch((10003..20006).collect()),
+                make_batch(vec![20006]),
+            ];
+            let writer = backend.clone();
+            let name = table.clone();
+            let counters = progress.clone();
+            snapshot::load(
+                batches.into_iter(),
+                std::num::NonZeroUsize::new(3).unwrap(),
+                CancellationToken::new(),
+                move |batch, token| {
+                    let writer = writer.clone();
+                    let name = name.clone();
+                    let counters = counters.clone();
+                    async move {
+                        writer
+                            .write_snapshot_chunk(name, batch, counters, token)
+                            .await
+                    }
+                },
+            )
+            .await?;
+            assert_eq!(progress.written.load(Ordering::Relaxed), 20007);
+            assert_eq!(progress.committed.load(Ordering::Relaxed), 20007);
+
+            // One full array executes before the duplicate fails. Its 10,000 new
+            // rows must roll back, while all previously committed chunks survive.
+            let bad = make_batch((30000..40000).chain(std::iter::once(0)).collect());
+            assert!(
+                backend
+                    .write_snapshot_chunk(
+                        table.clone(),
+                        bad,
+                        progress.clone(),
+                        CancellationToken::new()
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(progress.written.load(Ordering::Relaxed), 30007);
+            assert_eq!(progress.committed.load(Ordering::Relaxed), 20007);
+            let token = CancellationToken::new();
+            token.cancel();
+            assert!(
+                backend
+                    .write_snapshot_chunk(
+                        table.clone(),
+                        make_batch(vec![50000]),
+                        progress.clone(),
+                        token
+                    )
+                    .await
+                    .is_err()
+            );
+            let row = conn.query_row(
+                &format!("SELECT COUNT(*), SUM(\"id\") FROM {}", quote_ident(&table)),
+                &[],
+            )?;
+            assert_eq!(row.get::<_, i64>(0)?, 20007);
+            assert_eq!(row.get::<_, i64>(1)?, 20006 * 20007 / 2);
+            Ok(())
+        }
+        .await;
+        drop_table_sync(&conn, &table)?;
+        result
+    }
 }

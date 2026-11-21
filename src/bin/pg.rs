@@ -161,12 +161,12 @@ fn typed_value_to_pg<'a>(val: &TypedValue<'a>, ty: &Type) -> PgValue<'a> {
 }
 
 async fn binary_copy_batches(
-    pool: &Pool,
+    client: &tokio_postgres::Client,
     table: &str,
     schema: &Schema,
-    batches: Box<dyn Iterator<Item = RecordBatch> + Send>,
+    batches: impl Iterator<Item = RecordBatch> + Send,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<usize> {
-    let client = pool.get().await?;
     let col_names: Vec<String> = schema
         .fields()
         .iter()
@@ -183,13 +183,15 @@ async fn binary_copy_batches(
     let writer = BinaryCopyInWriter::new(sink, &types);
     tokio::pin!(writer);
 
-    let mut total = 0;
-
     for batch in batches {
         let mut iter = batch_rows(&batch)?;
         let mut vals = Vec::with_capacity(batch.num_columns());
         let mut row = Vec::with_capacity(batch.num_columns());
         while iter.next_into(&mut vals) {
+            anyhow::ensure!(
+                !cancel.is_some_and(|c| c.is_cancelled()),
+                "snapshot cancelled"
+            );
             row.clear();
             row.extend(
                 vals.iter()
@@ -201,11 +203,9 @@ async fn binary_copy_batches(
                 .write_raw(row.iter().map(pg_as_to_sql))
                 .await?;
         }
-        total += batch.num_rows();
     }
 
-    writer.finish().await?;
-    Ok(total)
+    Ok(writer.finish().await? as usize)
 }
 
 fn generate_upsert_sql(target: &str, temp: &str, schema: &Schema) -> String {
@@ -332,25 +332,8 @@ impl TpchBackend for PostgresBackend {
         schema: &Schema,
         batches: Box<dyn Iterator<Item = RecordBatch> + Send>,
     ) -> Result<usize> {
-        binary_copy_batches(&self.pool, table, schema, batches).await
-    }
-
-    async fn copy_temp_to_target(&self, target: &str, temp: &str, schema: &Schema) -> Result<()> {
-        let cols = schema
-            .fields()
-            .iter()
-            .map(|f| quote_ident(f.name()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO {} ({}) SELECT {} FROM {}",
-            quote_ident(target),
-            cols,
-            cols,
-            quote_ident(temp)
-        );
-        self.pool.get().await?.execute(&sql, &[]).await?;
-        Ok(())
+        let client = self.pool.get().await?;
+        binary_copy_batches(&client, table, schema, batches, None).await
     }
 
     async fn upsert_from_temp(&self, target: &str, temp: &str, schema: &Schema) -> Result<()> {
@@ -377,8 +360,34 @@ impl TpchBackend for PostgresBackend {
         Ok(())
     }
 
-    fn needs_temp_for_snapshot() -> bool {
-        false
+    async fn write_snapshot_chunk(
+        &self,
+        table: String,
+        batch: RecordBatch,
+        progress: Arc<dbgen_rs::snapshot::Progress>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        anyhow::ensure!(!cancel.is_cancelled(), "snapshot cancelled");
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let schema = batch.schema();
+        let rows = binary_copy_batches(
+            tx.client(),
+            &table,
+            &schema,
+            std::iter::once(batch),
+            Some(&cancel),
+        )
+        .await?;
+        progress
+            .written
+            .fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
+        anyhow::ensure!(!cancel.is_cancelled(), "snapshot cancelled");
+        tx.commit().await?;
+        progress
+            .committed
+            .fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     fn supports_nested() -> bool {
@@ -394,4 +403,82 @@ async fn main() -> Result<()> {
     let backend = Arc::new(PostgresBackend::new(&cli)?);
     tpch::run(backend, cli.mode).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_integration_tests {
+    use super::*;
+    use arrow::array::Int32Array;
+    use dbgen_rs::snapshot::Progress;
+    use std::sync::atomic::Ordering;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    #[ignore = "requires a disposable localhost bench database and DBGEN_TEST_PORT/PASSWORD"]
+    async fn commits_failures_and_cancellation() -> Result<()> {
+        let port = std::env::var("DBGEN_TEST_PORT")?;
+        let password = std::env::var("DBGEN_TEST_PASSWORD")?;
+        let cli = Cli::try_parse_from([
+            "pg",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port,
+            "--user",
+            "postgres",
+            "--password",
+            &password,
+            "--database",
+            "bench",
+            "snapshot",
+        ])?;
+        let backend = PostgresBackend::new(&cli)?;
+        let conn = backend.pool.get().await?;
+        conn.batch_execute("DROP TABLE IF EXISTS dbgen_snapshot_test; CREATE TABLE dbgen_snapshot_test (id INTEGER PRIMARY KEY)").await?;
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = |values: Vec<i32>| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap()
+        };
+        let progress = Arc::new(Progress::default());
+        // Commit, fail after crossing driver buffers, cancel, then reuse the pool.
+        // Failed/cancelled chunks must preserve earlier commits and add no rows.
+        for (values, cancelled, succeeds, committed) in [
+            ((0..10).collect(), false, true, 10),
+            (
+                (100..20100).chain(std::iter::once(0)).collect(),
+                false,
+                false,
+                10,
+            ),
+            (vec![30000], true, false, 10),
+            (vec![40000], false, true, 11),
+        ] {
+            let cancel = CancellationToken::new();
+            if cancelled {
+                cancel.cancel();
+            }
+            let result = backend
+                .write_snapshot_chunk(
+                    "dbgen_snapshot_test".into(),
+                    batch(values),
+                    progress.clone(),
+                    cancel,
+                )
+                .await;
+            assert_eq!(result.is_ok(), succeeds, "{result:?}");
+            assert_eq!(progress.written.load(Ordering::Relaxed), committed);
+            assert_eq!(progress.committed.load(Ordering::Relaxed), committed);
+        }
+        let count: i64 = conn
+            .query_one("SELECT COUNT(*) FROM dbgen_snapshot_test", &[])
+            .await?
+            .get(0);
+        assert_eq!(count, 11);
+        conn.execute("DROP TABLE dbgen_snapshot_test", &[]).await?;
+        Ok(())
+    }
 }
