@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use chrono::NaiveDate;
@@ -40,7 +40,7 @@ impl OracleBackend {
         let conn_str = format!("//{}:{}/{}", cli.host, cli.port, cli.database);
         let mut pb = PoolBuilder::new(&cli.user, &cli.password, &conn_str);
         pb.min_connections(0);
-        pb.max_connections(16);
+        pb.max_connections(u32::try_from(cli.mode.snapshot_workers().max(16))?);
         pb.timeout(Duration::from_secs(60))?;
         pb.get_mode(GetMode::Wait);
         pb.stmt_cache_size(1024);
@@ -357,6 +357,18 @@ impl TpchBackend for OracleBackend {
             result.map(|_| ())
         })
         .await?
+        .map_err(|e| {
+            // ORA-01013: OCI's SIGINT handler still runs after ours and cancels the call.
+            let interrupted = e
+                .downcast_ref::<oracle::Error>()
+                .and_then(oracle::Error::oci_code)
+                == Some(1013);
+            if interrupted {
+                anyhow!("snapshot cancelled")
+            } else {
+                e
+            }
+        })
     }
 
     fn is_blocking() -> bool {
@@ -372,8 +384,10 @@ async fn main() -> Result<()> {
     let backend = Arc::new(OracleBackend::new(&cli)?);
 
     // OCI installs its own SIGINT handler during init and doesn't restore it
-    // (https://github.com/kubo/rust-oracle/issues/37). Install ours after the
-    // pool is built so it overrides OCI's via sigaction.
+    // (https://github.com/kubo/rust-oracle/issues/37). Tokio's handler, registered
+    // after the pool is built, chains to OCI's rather than replacing it, so Ctrl-C
+    // also cancels in-flight calls with ORA-01013. CDC exits here. Snapshots cancel
+    // through the coordinator.
     if matches!(&cli.mode, Mode::Cdc(_)) {
         tokio::spawn(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -386,110 +400,28 @@ async fn main() -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+mod snapshot_integration_tests {
     use super::*;
-    use arrow::array::Int32Array;
-    use arrow::datatypes::Field;
-    use dbgen_rs::snapshot::{self, Progress};
-    use std::sync::atomic::Ordering;
-    use tokio_util::sync::CancellationToken;
+    use dbgen_rs::testing::{check_snapshot_chunks, cli_args};
 
-    // Explicit opt-in only; use a dedicated test database, never a benchmark source.
     #[tokio::test]
-    #[ignore = "requires TEST_ORACLE_CONNECT_STRING, TEST_ORACLE_USER, TEST_ORACLE_PASSWORD"]
-    async fn snapshot_chunk_commits_and_rollback() -> Result<()> {
-        let pool = PoolBuilder::new(
-            std::env::var("TEST_ORACLE_USER")?,
-            std::env::var("TEST_ORACLE_PASSWORD")?,
-            std::env::var("TEST_ORACLE_CONNECT_STRING")?,
-        )
-        .max_connections(4)
-        .get_mode(GetMode::Wait)
-        .build()?;
-        let backend = Arc::new(OracleBackend {
-            pool: Arc::new(pool),
-        });
+    #[ignore = "requires a disposable localhost FREEPDB1 with user bench and DBGEN_TEST_PORT/PASSWORD"]
+    async fn commits_failures_and_cancellation() -> Result<()> {
+        let cli = Cli::try_parse_from(cli_args("oracle", "bench", "FREEPDB1")?)?;
+        let backend = Arc::new(OracleBackend::new(&cli)?);
         let conn = backend.pool.get()?;
-        let table = format!(
-            "dbgen_test_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_millis()
-        );
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        create_table_sync(&conn, &table, &schema, Some(&["id"]))?;
-        let make_batch = |values: Vec<i32>| {
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap()
-        };
-        let progress = Arc::new(Progress::default());
-        let result: Result<()> = async {
-            let batches = vec![
-                make_batch((0..10003).collect()),
-                make_batch((10003..20006).collect()),
-                make_batch(vec![20006]),
-            ];
-            let writer = backend.clone();
-            let name = table.clone();
-            let counters = progress.clone();
-            snapshot::load(
-                batches.into_iter(),
-                std::num::NonZeroUsize::new(3).unwrap(),
-                CancellationToken::new(),
-                move |batch, token| {
-                    let writer = writer.clone();
-                    let name = name.clone();
-                    let counters = counters.clone();
-                    async move {
-                        writer
-                            .write_snapshot_chunk(name, batch, counters, token)
-                            .await
-                    }
-                },
-            )
-            .await?;
-            assert_eq!(progress.written.load(Ordering::Relaxed), 20007);
-            assert_eq!(progress.committed.load(Ordering::Relaxed), 20007);
-
-            // One full array executes before the duplicate fails. Its 10,000 new
-            // rows must roll back, while all previously committed chunks survive.
-            let bad = make_batch((30000..40000).chain(std::iter::once(0)).collect());
-            assert!(
-                backend
-                    .write_snapshot_chunk(
-                        table.clone(),
-                        bad,
-                        progress.clone(),
-                        CancellationToken::new()
-                    )
-                    .await
-                    .is_err()
-            );
-            assert_eq!(progress.written.load(Ordering::Relaxed), 30007);
-            assert_eq!(progress.committed.load(Ordering::Relaxed), 20007);
-            let token = CancellationToken::new();
-            token.cancel();
-            assert!(
-                backend
-                    .write_snapshot_chunk(
-                        table.clone(),
-                        make_batch(vec![50000]),
-                        progress.clone(),
-                        token
-                    )
-                    .await
-                    .is_err()
-            );
-            let row = conn.query_row(
-                &format!("SELECT COUNT(*), SUM(\"id\") FROM {}", quote_ident(&table)),
-                &[],
-            )?;
-            assert_eq!(row.get::<_, i64>(0)?, 20007);
-            assert_eq!(row.get::<_, i64>(1)?, 20006 * 20007 / 2);
-            Ok(())
-        }
+        drop_table_sync(&conn, "dbgen_snapshot_test")?;
+        conn.execute(
+            "CREATE TABLE \"dbgen_snapshot_test\" (\"id\" NUMBER(10) PRIMARY KEY)",
+            &[],
+        )?;
+        let client = &conn;
+        let result = check_snapshot_chunks(backend.clone(), "dbgen_snapshot_test", || async move {
+            let row = client.query_row("SELECT COUNT(*) FROM \"dbgen_snapshot_test\"", &[])?;
+            Ok(row.get::<_, u64>(0)?)
+        })
         .await;
-        drop_table_sync(&conn, &table)?;
+        drop_table_sync(&conn, "dbgen_snapshot_test")?;
         result
     }
 }

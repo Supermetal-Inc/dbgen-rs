@@ -10,7 +10,7 @@ use dbgen_rs::tpch::{
     get_comment_column, get_pk_columns,
 };
 use futures_util::{StreamExt, stream};
-use mysql_async::{Conn, Opts, OptsBuilder, TxOpts, prelude::Queryable};
+use mysql_async::{Conn, Opts, OptsBuilder, PoolConstraints, PoolOpts, TxOpts, prelude::Queryable};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
@@ -41,7 +41,13 @@ struct MysqlBackend {
 
 impl MysqlBackend {
     fn new(cli: &Cli) -> Self {
+        let pool_opts = PoolOpts::default();
+        let limits = pool_opts.constraints();
+        let max = limits.max().max(cli.mode.snapshot_workers());
         let opts = OptsBuilder::default()
+            .pool_opts(pool_opts.with_constraints(
+                PoolConstraints::new(limits.min(), max).expect("default min <= max"),
+            ))
             .ip_or_hostname(&cli.host)
             .tcp_port(cli.port)
             .db_name(Some(&cli.database))
@@ -362,79 +368,29 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod snapshot_integration_tests {
     use super::*;
-    use arrow::array::Int32Array;
-    use dbgen_rs::snapshot::Progress;
-    use std::sync::atomic::Ordering;
-    use tokio_util::sync::CancellationToken;
+    use dbgen_rs::testing::{check_snapshot_chunks, cli_args};
 
     #[tokio::test]
-    #[ignore = "requires a disposable localhost bench database and DBGEN_TEST_PORT/PASSWORD"]
+    #[ignore = "requires a disposable localhost database and DBGEN_TEST_PORT/PASSWORD"]
     async fn commits_failures_and_cancellation() -> Result<()> {
-        let port = std::env::var("DBGEN_TEST_PORT")?;
-        let password = std::env::var("DBGEN_TEST_PASSWORD")?;
-        let cli = Cli::try_parse_from([
-            "mysql",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port,
-            "--user",
-            "root",
-            "--password",
-            &password,
-            "--database",
-            "bench",
-            "snapshot",
-        ])?;
-        let backend = MysqlBackend::new(&cli);
+        let cli = Cli::try_parse_from(cli_args("mysql", "root", "bench")?)?;
+        let backend = Arc::new(MysqlBackend::new(&cli));
         let mut conn = backend.snapshot_pool.get_conn().await?;
         conn.query_drop("DROP TABLE IF EXISTS dbgen_snapshot_test")
             .await?;
         conn.query_drop("CREATE TABLE dbgen_snapshot_test (id INT PRIMARY KEY) ENGINE=InnoDB")
             .await?;
-        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
-        let batch = |values: Vec<i32>| {
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap()
-        };
-        let progress = Arc::new(Progress::default());
-        // Commit, fail after crossing driver buffers, cancel, then reuse the pool.
-        // Failed/cancelled chunks must preserve earlier commits and add no rows.
-        for (values, cancelled, succeeds, committed) in [
-            ((0..10).collect(), false, true, 10),
-            (
-                (100..20100).chain(std::iter::once(0)).collect(),
-                false,
-                false,
-                10,
-            ),
-            (vec![30000], true, false, 10),
-            (vec![40000], false, true, 11),
-        ] {
-            let cancel = CancellationToken::new();
-            if cancelled {
-                cancel.cancel();
-            }
-            let result = backend
-                .write_snapshot_chunk(
-                    "dbgen_snapshot_test".into(),
-                    batch(values),
-                    progress.clone(),
-                    cancel,
-                )
-                .await;
-            assert_eq!(result.is_ok(), succeeds, "{result:?}");
-            assert_eq!(progress.written.load(Ordering::Relaxed), committed);
-            assert_eq!(progress.committed.load(Ordering::Relaxed), committed);
-        }
-        let count: Option<u64> = conn
-            .query_first("SELECT COUNT(*) FROM dbgen_snapshot_test")
-            .await?;
-        assert_eq!(count, Some(11));
+        let pool = &backend.snapshot_pool;
+        let result = check_snapshot_chunks(backend.clone(), "dbgen_snapshot_test", || async move {
+            let count = pool
+                .get_conn()
+                .await?
+                .query_first("SELECT COUNT(*) FROM dbgen_snapshot_test")
+                .await?;
+            Ok(count.unwrap_or(0))
+        })
+        .await;
         conn.query_drop("DROP TABLE dbgen_snapshot_test").await?;
-        Ok(())
+        result
     }
 }

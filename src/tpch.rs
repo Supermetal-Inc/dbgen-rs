@@ -36,13 +36,16 @@ pub fn parse_tables(tables: &str) -> Result<Vec<String>> {
         return Ok(ALL_TABLES.iter().map(|s| s.to_string()).collect());
     }
     let names: Vec<String> = tables.split(',').map(|s| s.trim().to_lowercase()).collect();
-    for name in &names {
+    for (i, name) in names.iter().enumerate() {
         if !ALL_TABLES.contains(&name.as_str()) {
             bail!(
                 "unknown table: '{}'. valid tables: {}",
                 name,
                 ALL_TABLES.join(", ")
             );
+        }
+        if names[..i].contains(name) {
+            bail!("duplicate table: '{}'", name);
         }
     }
     Ok(names)
@@ -96,6 +99,16 @@ pub fn get_comment_column(table: &str) -> &'static str {
 pub enum Mode {
     Snapshot(SnapshotArgs),
     Cdc(CdcArgs),
+}
+
+impl Mode {
+    /// Pools must hold at least this many connections, or extra workers only hold chunks.
+    pub fn snapshot_workers(&self) -> usize {
+        match self {
+            Mode::Snapshot(args) => args.workers.get(),
+            Mode::Cdc(_) => 0,
+        }
+    }
 }
 
 #[derive(Args, Clone)]
@@ -434,14 +447,6 @@ pub async fn run<B: TpchBackend>(backend: Arc<B>, mode: Mode) -> Result<()> {
 
 async fn run_snapshot<B: TpchBackend>(backend: Arc<B>, args: SnapshotArgs) -> Result<()> {
     let tables = parse_tables(&args.tables)?;
-    if tables
-        .iter()
-        .collect::<std::collections::HashSet<_>>()
-        .len()
-        != tables.len()
-    {
-        bail!("snapshot tables must not contain duplicates");
-    }
     info!(
         "Snapshot: sf={}, tables={:?}, drop={}",
         args.scale_factor, tables, args.drop
@@ -697,5 +702,12 @@ mod snapshot_tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             total
         );
+    }
+
+    #[test]
+    fn duplicate_tables_are_rejected() {
+        let err = parse_tables("region, Region").unwrap_err();
+        assert_eq!(err.to_string(), "duplicate table: 'region'");
+        assert_eq!(parse_tables("region,nation").unwrap(), ["region", "nation"]);
     }
 }

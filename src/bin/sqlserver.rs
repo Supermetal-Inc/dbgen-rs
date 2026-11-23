@@ -40,7 +40,7 @@ impl SqlServerBackend {
             .database(&cli.database)
             .authentication(tiberius::AuthMethod::sql_server(&cli.user, &cli.password))
             .trust_cert()
-            .max_size(16);
+            .max_size(cli.mode.snapshot_workers().max(16));
         Ok(Self {
             pool: manager.create_pool()?,
         })
@@ -309,7 +309,11 @@ impl TpchBackend for SqlServerBackend {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Tiberius logs each BEGIN and COMMIT at INFO, two lines per snapshot chunk.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info,tiberius=warn"),
+    )
+    .init();
     let cli = Cli::parse();
     info!("Target: {}:{}/{}", cli.host, cli.port, cli.database);
     let backend = Arc::new(SqlServerBackend::new(&cli)?);
@@ -340,79 +344,28 @@ mod tests {
 #[cfg(test)]
 mod snapshot_integration_tests {
     use super::*;
-    use arrow::array::Int32Array;
-    use dbgen_rs::snapshot::Progress;
-    use std::sync::atomic::Ordering;
-    use tokio_util::sync::CancellationToken;
+    use dbgen_rs::testing::{check_snapshot_chunks, cli_args};
 
     #[tokio::test]
-    #[ignore = "requires a disposable localhost bench database and DBGEN_TEST_PORT/PASSWORD"]
+    #[ignore = "requires a disposable localhost database and DBGEN_TEST_PORT/PASSWORD"]
     async fn commits_failures_and_cancellation() -> Result<()> {
-        let port = std::env::var("DBGEN_TEST_PORT")?;
-        let password = std::env::var("DBGEN_TEST_PASSWORD")?;
-        let cli = Cli::try_parse_from([
-            "sqlserver",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port,
-            "--user",
-            "sa",
-            "--password",
-            &password,
-            "--database",
-            "bench",
-            "snapshot",
-        ])?;
-        let backend = SqlServerBackend::new(&cli)?;
+        let cli = Cli::try_parse_from(cli_args("sqlserver", "sa", "bench")?)?;
+        let backend = Arc::new(SqlServerBackend::new(&cli)?);
         let mut conn = backend.pool.get().await?;
         conn.execute("DROP TABLE IF EXISTS dbgen_snapshot_test; CREATE TABLE dbgen_snapshot_test (id INT PRIMARY KEY)", &[]).await?;
-        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
-        let batch = |values: Vec<i32>| {
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))]).unwrap()
-        };
-        let progress = Arc::new(Progress::default());
-        // Commit, fail after crossing driver buffers, cancel, then reuse the pool.
-        // Failed/cancelled chunks must preserve earlier commits and add no rows.
-        for (values, cancelled, succeeds, committed) in [
-            ((0..10).collect(), false, true, 10),
-            (
-                (100..20100).chain(std::iter::once(0)).collect(),
-                false,
-                false,
-                10,
-            ),
-            (vec![30000], true, false, 10),
-            (vec![40000], false, true, 11),
-        ] {
-            let cancel = CancellationToken::new();
-            if cancelled {
-                cancel.cancel();
-            }
-            let result = backend
-                .write_snapshot_chunk(
-                    "dbgen_snapshot_test".into(),
-                    batch(values),
-                    progress.clone(),
-                    cancel,
-                )
-                .await;
-            assert_eq!(result.is_ok(), succeeds, "{result:?}");
-            assert_eq!(progress.written.load(Ordering::Relaxed), committed);
-            assert_eq!(progress.committed.load(Ordering::Relaxed), committed);
-        }
-        let row = conn
-            .query("SELECT COUNT(*) FROM dbgen_snapshot_test", &[])
-            .await?
-            .into_row()
-            .await?
-            .unwrap();
-        assert_eq!(row.get::<i32, _>(0), Some(11));
+        let pool = &backend.pool;
+        let result = check_snapshot_chunks(backend.clone(), "dbgen_snapshot_test", || async move {
+            let row = pool
+                .get()
+                .await?
+                .query("SELECT COUNT(*) FROM dbgen_snapshot_test", &[])
+                .await?
+                .into_row()
+                .await?;
+            Ok(row.and_then(|r| r.get::<i32, _>(0)).unwrap_or(0) as u64)
+        })
+        .await;
         conn.execute("DROP TABLE dbgen_snapshot_test", &[]).await?;
-        Ok(())
+        result
     }
 }
