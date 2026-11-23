@@ -48,7 +48,7 @@ where
     let progress = Arc::new(Progress::default());
     let committed = || progress.committed.load(Ordering::Relaxed);
 
-    // Concurrent chunks, two of them crossing Oracle's 10,000-row array size.
+    // Concurrent chunks through the shared workers.
     let chunks = vec![
         batch((0..10_003).collect())?,
         batch((10_003..20_006).collect())?,
@@ -72,7 +72,7 @@ where
     assert_eq!(count().await?, 20_007);
     assert_eq!(committed(), 20_007);
 
-    // The duplicate key arrives after driver buffers flush and Oracle arrays execute.
+    // The duplicate key arrives last, after the driver has already sent 20,000 rows.
     let duplicate = batch((30_000..50_000).chain([0]).collect())?;
     let result = backend
         .write_snapshot_chunk(
