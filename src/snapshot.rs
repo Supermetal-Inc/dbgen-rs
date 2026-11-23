@@ -19,6 +19,18 @@ pub struct Progress {
 }
 
 impl Progress {
+    pub fn add_generated(&self, rows: usize) {
+        self.generated.fetch_add(rows as u64, Ordering::Relaxed);
+    }
+
+    pub fn add_written(&self, rows: usize) {
+        self.written.fetch_add(rows as u64, Ordering::Relaxed);
+    }
+
+    pub fn add_committed(&self, rows: usize) {
+        self.committed.fetch_add(rows as u64, Ordering::Relaxed);
+    }
+
     pub fn log(&self) {
         log::info!(
             "Snapshot rows: generated={}, written={}, committed={}",

@@ -382,14 +382,10 @@ impl TpchBackend for PostgresBackend {
             Some(&cancel),
         )
         .await?;
-        progress
-            .written
-            .fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
+        progress.add_written(rows);
         anyhow::ensure!(!cancel.is_cancelled(), "snapshot cancelled");
         tx.commit().await?;
-        progress
-            .committed
-            .fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
+        progress.add_committed(rows);
         Ok(())
     }
 

@@ -540,10 +540,7 @@ fn snapshot_chunks(
     Ok(std::iter::from_fn(move || {
         while let Some((table, mut source)) = sources.pop_front() {
             if let Some(batch) = source.next() {
-                progress.generated.fetch_add(
-                    batch.num_rows() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                progress.add_generated(batch.num_rows());
                 sources.push_back((table.clone(), source));
                 return Some((table, batch));
             }

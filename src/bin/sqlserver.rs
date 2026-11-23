@@ -289,9 +289,7 @@ impl TpchBackend for SqlServerBackend {
             .await?;
         let rows = bulk_batch(client, &table, &batch, Some(&cancel)).await?;
         anyhow::ensure!(rows == batch.num_rows(), "bulk insert row count mismatch");
-        progress
-            .written
-            .fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
+        progress.add_written(rows);
         anyhow::ensure!(!cancel.is_cancelled(), "snapshot cancelled");
         client
             .simple_query("COMMIT TRANSACTION")
@@ -300,9 +298,7 @@ impl TpchBackend for SqlServerBackend {
             .await?;
         // Only a successfully committed connection can return to the pool.
         drop(guard.client.take());
-        progress
-            .committed
-            .fetch_add(rows as u64, std::sync::atomic::Ordering::Relaxed);
+        progress.add_committed(rows);
         Ok(())
     }
 }

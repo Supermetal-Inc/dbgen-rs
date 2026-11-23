@@ -48,12 +48,6 @@ mysql snapshot [OPTIONS]
 
 Tables are loaded in parallel. PostgreSQL uses `COPY BINARY`, SQL Server uses bulk insert, Oracle uses array-bound batch inserts, MySQL uses `LOAD DATA LOCAL INFILE`.
 
-Snapshots default to 8 shared workers and at most 100,000 rows per commit:
-
-```sh
-oracle snapshot --scale-factor 1 --workers 8 --commit-rows 100000
-```
-
 Workers share chunks across tables, including the final large table. At most one
 Arrow chunk per worker is resident, plus generator and driver buffers; generation
 is serialized and overlaps writes. Connections and commits remain backend-specific.

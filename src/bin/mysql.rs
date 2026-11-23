@@ -239,16 +239,12 @@ async fn load_batch(
         );
     }
     if let Some((progress, cancel)) = snapshot {
-        progress
-            .written
-            .fetch_add(expected as u64, std::sync::atomic::Ordering::Relaxed);
+        progress.add_written(expected);
         anyhow::ensure!(!cancel.is_cancelled(), "snapshot cancelled");
     }
     tx.commit().await?;
     if let Some((progress, _)) = snapshot {
-        progress
-            .committed
-            .fetch_add(expected as u64, std::sync::atomic::Ordering::Relaxed);
+        progress.add_committed(expected);
     }
     Ok(expected)
 }

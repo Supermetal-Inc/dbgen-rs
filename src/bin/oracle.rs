@@ -180,56 +180,36 @@ fn bulk_insert_sync(
         placeholders.join(", ")
     );
 
-    let array_rows = 10_000;
-    let mut batch = conn.batch(&sql, array_rows).build()?;
+    let mut batch = conn.batch(&sql, 10000).build()?;
     let mut total = 0;
-    let mut pending = 0;
     let check_cancel = || -> Result<()> {
         if snapshot.is_some_and(|(_, token)| token.is_cancelled()) {
             bail!("snapshot cancelled");
         }
         Ok(())
     };
-    check_cancel()?;
 
     for rb in batches {
         let mut iter = batch_rows(&rb)?;
         let mut vals = Vec::with_capacity(rb.num_columns());
         while iter.next_into(&mut vals) {
-            if pending == 0 {
-                check_cancel()?;
-            }
+            check_cancel()?;
             for (index, val) in vals.iter().enumerate() {
                 batch.set(index + 1, typed_value_to_ora(val).as_to_sql())?;
             }
             batch.append_row(&[])?;
-            pending += 1;
-            if let Some((progress, _)) = snapshot
-                && pending == array_rows as u64
-            {
-                // append_row executes a full array batch automatically.
-                progress
-                    .written
-                    .fetch_add(pending, std::sync::atomic::Ordering::Relaxed);
-                pending = 0;
-            }
         }
         total += rb.num_rows();
     }
 
-    check_cancel()?;
     batch.execute()?;
     if let Some((progress, _)) = snapshot {
-        progress
-            .written
-            .fetch_add(pending, std::sync::atomic::Ordering::Relaxed);
+        progress.add_written(total);
     }
     check_cancel()?;
     conn.commit()?;
     if let Some((progress, _)) = snapshot {
-        progress
-            .committed
-            .fetch_add(total as u64, std::sync::atomic::Ordering::Relaxed);
+        progress.add_committed(total);
     }
     Ok(total)
 }
