@@ -36,8 +36,7 @@ impl OracleBackend {
             .set_credentials(&cli.user, &cli.password)
             .set_connect_string(&conn_str)?
             .set_min_connections(0)
-            .set_max_connections(cli.mode.snapshot_workers().max(16))
-            .set_stmtcachesize(1024);
+            .set_max_connections(cli.mode.snapshot_workers().max(16));
         Ok(Self {
             pool: Arc::new(oracledb::create_pool(config)?),
         })
@@ -304,7 +303,7 @@ mod snapshot_integration_tests {
         let client = &conn;
         let result = check_snapshot_chunks(backend.clone(), "dbgen_snapshot_test", || async move {
             let row = client.query_row("SELECT COUNT(*) FROM \"dbgen_snapshot_test\"", &[])?;
-            Ok(row.get::<i64>(0)? as u64)
+            Ok(row.get::<u64>(0)?)
         })
         .await;
         drop_table_sync(&conn, "dbgen_snapshot_test")?;
