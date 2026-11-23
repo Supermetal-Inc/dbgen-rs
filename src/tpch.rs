@@ -209,7 +209,8 @@ impl Iterator for TpchTable {
             TpchTable::Orders(g) => g.next(),
             TpchTable::LineItem(g) => g.next(),
         }?;
-        // tpchgen-arrow only fails building a batch for its own fixed schema, a bug there.
+        // tpchgen-arrow builds both the schema and the columns, so try_new can only fail on a
+        // tpchgen-arrow bug.
         Some(batch.expect("tpchgen-arrow batch matches its schema"))
     }
 }
