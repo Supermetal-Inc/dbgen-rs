@@ -36,13 +36,16 @@ pub fn parse_tables(tables: &str) -> Result<Vec<String>> {
         return Ok(ALL_TABLES.iter().map(|s| s.to_string()).collect());
     }
     let names: Vec<String> = tables.split(',').map(|s| s.trim().to_lowercase()).collect();
-    for name in &names {
+    for (i, name) in names.iter().enumerate() {
         if !ALL_TABLES.contains(&name.as_str()) {
             bail!(
                 "unknown table: '{}'. valid tables: {}",
                 name,
                 ALL_TABLES.join(", ")
             );
+        }
+        if names[..i].contains(name) {
+            bail!("duplicate table: '{}'", name);
         }
     }
     Ok(names)
@@ -98,8 +101,24 @@ pub enum Mode {
     Cdc(CdcArgs),
 }
 
+impl Mode {
+    /// Pools must hold at least this many connections, or extra workers only hold chunks.
+    pub fn snapshot_workers(&self) -> usize {
+        match self {
+            Mode::Snapshot(args) => args.workers.get(),
+            Mode::Cdc(_) => 0,
+        }
+    }
+}
+
 #[derive(Args, Clone)]
 pub struct SnapshotArgs {
+    /// Shared snapshot writers
+    #[arg(long, default_value = "8")]
+    pub workers: std::num::NonZeroUsize,
+    /// Maximum rows per transaction
+    #[arg(long, default_value = "100000")]
+    pub commit_rows: std::num::NonZeroUsize,
     #[arg(long, default_value_t = 0.01)]
     pub scale_factor: f64,
     #[arg(long, default_value = "all")]
@@ -375,12 +394,6 @@ pub trait TpchBackend: Send + Sync + 'static {
         schema: &Schema,
         batches: Box<dyn Iterator<Item = RecordBatch> + Send>,
     ) -> impl Future<Output = Result<usize>> + Send;
-    fn copy_temp_to_target(
-        &self,
-        target: &str,
-        temp: &str,
-        schema: &Schema,
-    ) -> impl Future<Output = Result<()>> + Send;
     fn upsert_from_temp(
         &self,
         target: &str,
@@ -389,7 +402,15 @@ pub trait TpchBackend: Send + Sync + 'static {
     ) -> impl Future<Output = Result<()>> + Send;
     fn truncate_table(&self, table: &str) -> impl Future<Output = Result<()>> + Send;
     fn drop_temp_table(&self, table: &str) -> impl Future<Output = Result<()>> + Send;
-    fn needs_temp_for_snapshot() -> bool;
+
+    /// Write and commit one independent chunk; check cancellation before commit.
+    fn write_snapshot_chunk(
+        &self,
+        table: String,
+        batch: RecordBatch,
+        progress: Arc<crate::snapshot::Progress>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> impl Future<Output = Result<()>> + Send;
 
     fn is_blocking() -> bool {
         false
@@ -449,64 +470,83 @@ async fn run_snapshot<B: TpchBackend>(backend: Arc<B>, args: SnapshotArgs) -> Re
         return Ok(());
     }
 
-    let mut set: JoinSet<Result<(String, usize)>> = JoinSet::new();
-    let handle = tokio::runtime::Handle::current();
-    for table in tables {
-        let backend = Arc::clone(&backend);
-        let sf = args.scale_factor;
-        let nested = args.nested;
-        let task = async move {
-            let n = load_table_snapshot::<B>(backend, table.clone(), sf, nested).await?;
-            Ok::<_, anyhow::Error>((table, n))
-        };
-        if B::is_blocking() {
-            let handle = handle.clone();
-            set.spawn_blocking(move || handle.block_on(task));
-        } else {
-            set.spawn(task);
+    use crate::snapshot::{self, Progress};
+    let progress = Arc::new(Progress::default());
+    let chunks = snapshot_chunks(
+        tables,
+        args.scale_factor,
+        args.nested,
+        args.commit_rows.get(),
+        progress.clone(),
+    )?;
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let counters = progress.clone();
+    let load = snapshot::load(
+        chunks,
+        args.workers,
+        cancel.clone(),
+        move |(table, batch), token| {
+            let backend = backend.clone();
+            let counters = counters.clone();
+            async move {
+                backend
+                    .write_snapshot_chunk(table, batch, counters, token)
+                    .await
+            }
+        },
+    );
+    tokio::pin!(load);
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    let result = loop {
+        tokio::select! {
+            result = &mut load => break result,
+            _ = interval.tick() => progress.log(),
+            // Tokio replaces SIGINT's default action, so a call stuck on a lock would
+            // otherwise only die to SIGKILL. Open transactions roll back on disconnect.
+            _ = tokio::signal::ctrl_c() => {
+                if cancel.is_cancelled() {
+                    progress.log();
+                    std::process::exit(130);
+                }
+                cancel.cancel();
+                info!(
+                    "Stopping snapshot admission; waiting for in-flight database calls (Ctrl-C again to exit now)"
+                );
+            }
         }
-    }
-
-    while let Some(result) = set.join_next().await {
-        match result? {
-            Ok((table, rows)) => info!("[{}]: loaded {} rows", table, rows),
-            Err(e) => return Err(e),
-        }
-    }
-
+    };
+    progress.log();
+    result.context("snapshot may be partially committed; recreate selected tables before retrying (no automatic resume)")?;
     info!("Snapshot complete.");
     Ok(())
 }
 
-async fn load_table_snapshot<B: TpchBackend>(
-    backend: Arc<B>,
-    table: String,
-    scale_factor: f64,
+// Round-robin sources give small tables a chance while allowing every worker to
+// drain the final large table. Each iterator is advanced exactly once per chunk.
+fn snapshot_chunks(
+    tables: Vec<String>,
+    sf: f64,
     nested: bool,
-) -> Result<usize> {
-    let tpch = TableSource::new(&table, scale_factor, nested)?.with_batch_size(100_000);
-    let schema = tpch.schema();
-
-    let target = if B::needs_temp_for_snapshot() {
-        backend.create_temp_table(&table, &schema).await?
-    } else {
-        table.clone()
-    };
-
-    let total = backend
-        .copy_batches(&target, &schema, Box::new(tpch))
-        .await?;
-    info!("[{}]: {} rows", table, total);
-
-    if B::needs_temp_for_snapshot() {
-        info!("[{}]: copying temp to target...", table);
-        backend
-            .copy_temp_to_target(&table, &target, &schema)
-            .await?;
-        backend.drop_temp_table(&target).await?;
-    }
-
-    Ok(total)
+    rows: usize,
+    progress: Arc<crate::snapshot::Progress>,
+) -> Result<impl Iterator<Item = (String, RecordBatch)> + Send> {
+    let mut sources = tables
+        .into_iter()
+        .map(|table| {
+            let source = TableSource::new(&table, sf, nested)?.with_batch_size(rows);
+            Ok((table, source))
+        })
+        .collect::<Result<std::collections::VecDeque<_>>>()?;
+    Ok(std::iter::from_fn(move || {
+        while let Some((table, mut source)) = sources.pop_front() {
+            if let Some(batch) = source.next() {
+                progress.add_generated(batch.num_rows());
+                sources.push_back((table.clone(), source));
+                return Some((table, batch));
+            }
+        }
+        None
+    }))
 }
 
 async fn run_cdc<B: TpchBackend>(backend: Arc<B>, args: CdcArgs) -> Result<()> {
@@ -626,4 +666,53 @@ async fn cdc_batch<B: TpchBackend>(
     backend.upsert_from_temp(table, temp, schema).await?;
     backend.truncate_table(temp).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn chunks_preserve_every_table_and_bound_transaction_rows() {
+        let progress = Arc::new(crate::snapshot::Progress::default());
+        let mut actual = std::collections::HashMap::<String, Vec<RecordBatch>>::new();
+        let mut order = Vec::new();
+        for (table, batch) in snapshot_chunks(
+            parse_tables("all").unwrap(),
+            0.001,
+            false,
+            113,
+            progress.clone(),
+        )
+        .unwrap()
+        {
+            assert!(batch.num_rows() <= 113);
+            order.push(table.clone());
+            actual.entry(table).or_default().push(batch);
+        }
+        assert_eq!(&order[..8], ALL_TABLES);
+        let mut total = 0;
+        for table in ALL_TABLES {
+            let source = TableSource::new(table, 0.001, false).unwrap();
+            let schema = source.schema();
+            let expected =
+                arrow::compute::concat_batches(&schema, source.collect::<Vec<_>>().iter()).unwrap();
+            let actual = arrow::compute::concat_batches(&schema, &actual[*table]).unwrap();
+            assert_eq!(actual, expected, "{table}");
+            total += actual.num_rows() as u64;
+        }
+        assert_eq!(
+            progress
+                .generated
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total
+        );
+    }
+
+    #[test]
+    fn duplicate_tables_are_rejected() {
+        let err = parse_tables("region, Region").unwrap_err();
+        assert_eq!(err.to_string(), "duplicate table: 'region'");
+        assert_eq!(parse_tables("region,nation").unwrap(), ["region", "nation"]);
+    }
 }

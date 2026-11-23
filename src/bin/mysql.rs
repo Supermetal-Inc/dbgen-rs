@@ -10,7 +10,7 @@ use dbgen_rs::tpch::{
     get_comment_column, get_pk_columns,
 };
 use futures_util::{StreamExt, stream};
-use mysql_async::{Conn, Opts, OptsBuilder, TxOpts, prelude::Queryable};
+use mysql_async::{Conn, Opts, OptsBuilder, PoolConstraints, PoolOpts, TxOpts, prelude::Queryable};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Mutex;
 
@@ -34,13 +34,20 @@ struct Cli {
 type Connection = Arc<Mutex<Conn>>;
 struct MysqlBackend {
     opts: Opts,
+    snapshot_pool: mysql_async::Pool,
     // Keep one session per table: MySQL TEMPORARY tables are session scoped.
     connections: Mutex<HashMap<String, Connection>>,
 }
 
 impl MysqlBackend {
     fn new(cli: &Cli) -> Self {
+        let pool_opts = PoolOpts::default();
+        let limits = pool_opts.constraints();
+        let max = limits.max().max(cli.mode.snapshot_workers());
         let opts = OptsBuilder::default()
+            .pool_opts(pool_opts.with_constraints(
+                PoolConstraints::new(limits.min(), max).expect("default min <= max"),
+            ))
             .ip_or_hostname(&cli.host)
             .tcp_port(cli.port)
             .db_name(Some(&cli.database))
@@ -51,8 +58,10 @@ impl MysqlBackend {
                 "SET SESSION sql_mode = 'STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION'",
                 "SET NAMES utf8mb4",
             ]);
+        let opts: Opts = opts.into();
         Self {
-            opts: opts.into(),
+            snapshot_pool: mysql_async::Pool::new(opts.clone()),
+            opts,
             connections: Mutex::new(HashMap::new()),
         }
     }
@@ -193,7 +202,15 @@ fn load_sql(table: &str, schema: &Schema) -> String {
     )
 }
 
-async fn load_batch(conn: &mut Conn, sql: &str, batch: RecordBatch) -> Result<usize> {
+async fn load_batch(
+    conn: &mut Conn,
+    sql: &str,
+    batch: RecordBatch,
+    snapshot: Option<(
+        &dbgen_rs::snapshot::Progress,
+        &tokio_util::sync::CancellationToken,
+    )>,
+) -> Result<usize> {
     let expected = batch.num_rows();
     if expected == 0 {
         return Ok(0);
@@ -221,7 +238,14 @@ async fn load_batch(conn: &mut Conn, sql: &str, batch: RecordBatch) -> Result<us
             "LOAD DATA rejected batch: expected {expected} rows, loaded {affected}, warnings {warnings}: {details:?}"
         );
     }
+    if let Some((progress, cancel)) = snapshot {
+        progress.add_written(expected);
+        anyhow::ensure!(!cancel.is_cancelled(), "snapshot cancelled");
+    }
     tx.commit().await?;
+    if let Some((progress, _)) = snapshot {
+        progress.add_committed(expected);
+    }
     Ok(expected)
 }
 
@@ -288,22 +312,9 @@ impl TpchBackend for MysqlBackend {
         let sql = load_sql(table, schema);
         let mut total = 0;
         for batch in batches {
-            total += load_batch(&mut conn, &sql, batch).await?;
+            total += load_batch(&mut conn, &sql, batch, None).await?;
         }
         Ok(total)
-    }
-    async fn copy_temp_to_target(&self, target: &str, temp: &str, schema: &Schema) -> Result<()> {
-        self.execute(
-            target,
-            format!(
-                "INSERT INTO {} ({}) SELECT {} FROM {}",
-                quote_ident(target),
-                columns(schema),
-                columns(schema),
-                quote_ident(temp)
-            ),
-        )
-        .await
     }
     async fn upsert_from_temp(&self, target: &str, temp: &str, schema: &Schema) -> Result<()> {
         self.execute(target, upsert_sql(target, temp, schema)).await
@@ -321,8 +332,24 @@ impl TpchBackend for MysqlBackend {
         self.connections.lock().await.remove(table);
         Ok(())
     }
-    fn needs_temp_for_snapshot() -> bool {
-        false
+    async fn write_snapshot_chunk(
+        &self,
+        table: String,
+        batch: RecordBatch,
+        progress: Arc<dbgen_rs::snapshot::Progress>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        anyhow::ensure!(!cancel.is_cancelled(), "snapshot cancelled");
+        let mut conn = self.snapshot_pool.get_conn().await?;
+        anyhow::ensure!(!cancel.is_cancelled(), "snapshot cancelled");
+        load_batch(
+            &mut conn,
+            &load_sql(&table, &batch.schema()),
+            batch,
+            Some((&progress, &cancel)),
+        )
+        .await?;
+        Ok(())
     }
 }
 
@@ -332,4 +359,34 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     log::info!("Target: {}:{}/{}", cli.host, cli.port, cli.database);
     tpch::run(Arc::new(MysqlBackend::new(&cli)), cli.mode).await
+}
+
+#[cfg(test)]
+mod snapshot_integration_tests {
+    use super::*;
+    use dbgen_rs::testing::{check_snapshot_chunks, cli_args};
+
+    #[tokio::test]
+    #[ignore = "requires a disposable localhost database and DBGEN_TEST_PORT/PASSWORD"]
+    async fn commits_failures_and_cancellation() -> Result<()> {
+        let cli = Cli::try_parse_from(cli_args("mysql", "root", "bench")?)?;
+        let backend = Arc::new(MysqlBackend::new(&cli));
+        let mut conn = backend.snapshot_pool.get_conn().await?;
+        conn.query_drop("DROP TABLE IF EXISTS dbgen_snapshot_test")
+            .await?;
+        conn.query_drop("CREATE TABLE dbgen_snapshot_test (id INT PRIMARY KEY) ENGINE=InnoDB")
+            .await?;
+        let pool = &backend.snapshot_pool;
+        let result = check_snapshot_chunks(backend.clone(), "dbgen_snapshot_test", || async move {
+            let count = pool
+                .get_conn()
+                .await?
+                .query_first("SELECT COUNT(*) FROM dbgen_snapshot_test")
+                .await?;
+            Ok(count.unwrap_or(0))
+        })
+        .await;
+        conn.query_drop("DROP TABLE dbgen_snapshot_test").await?;
+        result
+    }
 }

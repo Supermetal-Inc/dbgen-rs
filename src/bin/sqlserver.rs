@@ -40,11 +40,47 @@ impl SqlServerBackend {
             .database(&cli.database)
             .authentication(tiberius::AuthMethod::sql_server(&cli.user, &cli.password))
             .trust_cert()
-            .max_size(16);
+            .max_size(cli.mode.snapshot_workers().max(16));
         Ok(Self {
             pool: manager.create_pool()?,
         })
     }
+}
+
+// Tiberius has no RAII transaction. Discard the connection on errors or dropped
+// futures so an open transaction/protocol stream can never return to the pool.
+struct SnapshotConnection {
+    client: Option<deadpool_tiberius::deadpool::managed::Object<Manager>>,
+}
+impl Drop for SnapshotConnection {
+    fn drop(&mut self) {
+        if let Some(client) = self.client.take() {
+            drop(deadpool_tiberius::deadpool::managed::Object::take(client));
+        }
+    }
+}
+
+async fn bulk_batch(
+    client: &mut deadpool_tiberius::Client,
+    table: &str,
+    batch: &RecordBatch,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<usize> {
+    let mut iter = batch_rows(batch)?;
+    let mut vals = Vec::with_capacity(batch.num_columns());
+    let mut req = client.bulk_insert(table).await?;
+    while iter.next_into(&mut vals) {
+        anyhow::ensure!(
+            !cancel.is_some_and(|c| c.is_cancelled()),
+            "snapshot cancelled"
+        );
+        let mut row = TokenRow::with_capacity(vals.len());
+        for val in &vals {
+            value_to_sql(&mut row, val);
+        }
+        req.send(row).await?;
+    }
+    Ok(req.finalize().await?.total() as usize)
 }
 
 fn quote_ident(name: &str) -> String {
@@ -205,37 +241,9 @@ impl TpchBackend for SqlServerBackend {
         let mut client = self.pool.get().await?;
         let mut total = 0;
         for batch in batches {
-            let mut iter = batch_rows(&batch)?;
-            let mut vals = Vec::with_capacity(batch.num_columns());
-            let mut req = client.bulk_insert(table).await?;
-            while iter.next_into(&mut vals) {
-                let mut row = TokenRow::with_capacity(vals.len());
-                for val in &vals {
-                    value_to_sql(&mut row, val);
-                }
-                req.send(row).await?;
-            }
-            total += req.finalize().await?.total() as usize;
+            total += bulk_batch(&mut client, table, &batch, None).await?;
         }
         Ok(total)
-    }
-
-    async fn copy_temp_to_target(&self, target: &str, temp: &str, schema: &Schema) -> Result<()> {
-        let cols = schema
-            .fields()
-            .iter()
-            .map(|f| quote_ident(f.name()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO {} ({}) SELECT {} FROM {}",
-            quote_ident(target),
-            cols,
-            cols,
-            quote_ident(temp)
-        );
-        self.pool.get().await?.execute(&sql, &[]).await?;
-        Ok(())
     }
 
     async fn upsert_from_temp(&self, target: &str, temp: &str, schema: &Schema) -> Result<()> {
@@ -262,14 +270,46 @@ impl TpchBackend for SqlServerBackend {
         Ok(())
     }
 
-    fn needs_temp_for_snapshot() -> bool {
-        false
+    async fn write_snapshot_chunk(
+        &self,
+        table: String,
+        batch: RecordBatch,
+        progress: Arc<dbgen_rs::snapshot::Progress>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        anyhow::ensure!(!cancel.is_cancelled(), "snapshot cancelled");
+        let mut guard = SnapshotConnection {
+            client: Some(self.pool.get().await?),
+        };
+        let client = guard.client.as_mut().unwrap();
+        client
+            .simple_query("SET XACT_ABORT ON; BEGIN TRANSACTION")
+            .await?
+            .into_results()
+            .await?;
+        let rows = bulk_batch(client, &table, &batch, Some(&cancel)).await?;
+        anyhow::ensure!(rows == batch.num_rows(), "bulk insert row count mismatch");
+        progress.add_written(rows);
+        anyhow::ensure!(!cancel.is_cancelled(), "snapshot cancelled");
+        client
+            .simple_query("COMMIT TRANSACTION")
+            .await?
+            .into_results()
+            .await?;
+        // Only a successfully committed connection can return to the pool.
+        drop(guard.client.take());
+        progress.add_committed(rows);
+        Ok(())
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Tiberius logs each BEGIN and COMMIT at INFO, two lines per snapshot chunk.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info,tiberius=warn"),
+    )
+    .init();
     let cli = Cli::parse();
     info!("Target: {}:{}/{}", cli.host, cli.port, cli.database);
     let backend = Arc::new(SqlServerBackend::new(&cli)?);
@@ -295,9 +335,33 @@ mod tests {
         assert_eq!(numeric.value(), 12_345);
         assert_eq!(numeric.scale(), 2);
     }
+}
 
-    #[test]
-    fn snapshots_bulk_load_directly_to_the_target() {
-        assert!(!SqlServerBackend::needs_temp_for_snapshot());
+#[cfg(test)]
+mod snapshot_integration_tests {
+    use super::*;
+    use dbgen_rs::testing::{check_snapshot_chunks, cli_args};
+
+    #[tokio::test]
+    #[ignore = "requires a disposable localhost database and DBGEN_TEST_PORT/PASSWORD"]
+    async fn commits_failures_and_cancellation() -> Result<()> {
+        let cli = Cli::try_parse_from(cli_args("sqlserver", "sa", "bench")?)?;
+        let backend = Arc::new(SqlServerBackend::new(&cli)?);
+        let mut conn = backend.pool.get().await?;
+        conn.execute("DROP TABLE IF EXISTS dbgen_snapshot_test; CREATE TABLE dbgen_snapshot_test (id INT PRIMARY KEY)", &[]).await?;
+        let pool = &backend.pool;
+        let result = check_snapshot_chunks(backend.clone(), "dbgen_snapshot_test", || async move {
+            let row = pool
+                .get()
+                .await?
+                .query("SELECT COUNT(*) FROM dbgen_snapshot_test", &[])
+                .await?
+                .into_row()
+                .await?;
+            Ok(row.and_then(|r| r.get::<i32, _>(0)).unwrap_or(0) as u64)
+        })
+        .await;
+        conn.execute("DROP TABLE dbgen_snapshot_test", &[]).await?;
+        result
     }
 }

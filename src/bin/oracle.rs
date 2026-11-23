@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use chrono::NaiveDate;
@@ -40,7 +40,7 @@ impl OracleBackend {
         let conn_str = format!("//{}:{}/{}", cli.host, cli.port, cli.database);
         let mut pb = PoolBuilder::new(&cli.user, &cli.password, &conn_str);
         pb.min_connections(0);
-        pb.max_connections(16);
+        pb.max_connections(u32::try_from(cli.mode.snapshot_workers().max(16))?);
         pb.timeout(Duration::from_secs(60))?;
         pb.get_mode(GetMode::Wait);
         pb.stmt_cache_size(1024);
@@ -161,7 +161,11 @@ fn bulk_insert_sync(
     conn: &oracle::Connection,
     table: &str,
     schema: &Schema,
-    batches: Box<dyn Iterator<Item = RecordBatch> + Send>,
+    batches: impl Iterator<Item = RecordBatch> + Send,
+    snapshot: Option<(
+        &dbgen_rs::snapshot::Progress,
+        &tokio_util::sync::CancellationToken,
+    )>,
 ) -> Result<usize> {
     let cols: Vec<String> = schema
         .fields()
@@ -178,11 +182,18 @@ fn bulk_insert_sync(
 
     let mut batch = conn.batch(&sql, 10000).build()?;
     let mut total = 0;
+    let check_cancel = || -> Result<()> {
+        if snapshot.is_some_and(|(_, token)| token.is_cancelled()) {
+            bail!("snapshot cancelled");
+        }
+        Ok(())
+    };
 
     for rb in batches {
         let mut iter = batch_rows(&rb)?;
         let mut vals = Vec::with_capacity(rb.num_columns());
         while iter.next_into(&mut vals) {
+            check_cancel()?;
             for (index, val) in vals.iter().enumerate() {
                 batch.set(index + 1, typed_value_to_ora(val).as_to_sql())?;
             }
@@ -192,7 +203,14 @@ fn bulk_insert_sync(
     }
 
     batch.execute()?;
+    if let Some((progress, _)) = snapshot {
+        progress.add_written(total);
+    }
+    check_cancel()?;
     conn.commit()?;
+    if let Some((progress, _)) = snapshot {
+        progress.add_committed(total);
+    }
     Ok(total)
 }
 
@@ -271,27 +289,7 @@ impl TpchBackend for OracleBackend {
         batches: Box<dyn Iterator<Item = RecordBatch> + Send>,
     ) -> Result<usize> {
         let conn = self.pool.get()?;
-        bulk_insert_sync(&conn, table, schema, batches)
-    }
-
-    async fn copy_temp_to_target(&self, target: &str, temp: &str, schema: &Schema) -> Result<()> {
-        let conn = self.pool.get()?;
-        let cols = schema
-            .fields()
-            .iter()
-            .map(|f| quote_ident(f.name()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "INSERT INTO {} ({}) SELECT {} FROM {}",
-            quote_ident(target),
-            cols,
-            cols,
-            quote_ident(temp)
-        );
-        conn.execute(&sql, &[])?;
-        conn.commit()?;
-        Ok(())
+        bulk_insert_sync(&conn, table, schema, batches, None)
     }
 
     async fn upsert_from_temp(&self, target: &str, temp: &str, schema: &Schema) -> Result<()> {
@@ -313,8 +311,44 @@ impl TpchBackend for OracleBackend {
         drop_table_sync(&conn, table)
     }
 
-    fn needs_temp_for_snapshot() -> bool {
-        false
+    async fn write_snapshot_chunk(
+        &self,
+        table: String,
+        batch: RecordBatch,
+        progress: Arc<dbgen_rs::snapshot::Progress>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = pool.get()?;
+            let schema = batch.schema();
+            let result = bulk_insert_sync(
+                &conn,
+                &table,
+                &schema,
+                std::iter::once(batch),
+                Some((&progress, &cancel)),
+            );
+            if result.is_err() {
+                // Preserve the original write/commit error. A failed commit reply may
+                // still mean the server committed; never retry automatically.
+                let _ = conn.rollback();
+            }
+            result.map(|_| ())
+        })
+        .await?
+        .map_err(|e| {
+            // ORA-01013: OCI's SIGINT handler still runs after ours and cancels the call.
+            let interrupted = e
+                .downcast_ref::<oracle::Error>()
+                .and_then(oracle::Error::oci_code)
+                == Some(1013);
+            if interrupted {
+                anyhow!("snapshot cancelled")
+            } else {
+                e
+            }
+        })
     }
 
     fn is_blocking() -> bool {
@@ -330,13 +364,44 @@ async fn main() -> Result<()> {
     let backend = Arc::new(OracleBackend::new(&cli)?);
 
     // OCI installs its own SIGINT handler during init and doesn't restore it
-    // (https://github.com/kubo/rust-oracle/issues/37). Install ours after the
-    // pool is built so it overrides OCI's via sigaction.
-    tokio::spawn(async {
-        let _ = tokio::signal::ctrl_c().await;
-        std::process::exit(130);
-    });
+    // (https://github.com/kubo/rust-oracle/issues/37). Tokio's handler, registered
+    // after the pool is built, chains to OCI's rather than replacing it, so Ctrl-C
+    // also cancels in-flight calls with ORA-01013. CDC exits here. Snapshots cancel
+    // through the coordinator.
+    if matches!(&cli.mode, Mode::Cdc(_)) {
+        tokio::spawn(async {
+            let _ = tokio::signal::ctrl_c().await;
+            std::process::exit(130);
+        });
+    }
 
     tpch::run(backend, cli.mode).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod snapshot_integration_tests {
+    use super::*;
+    use dbgen_rs::testing::{check_snapshot_chunks, cli_args};
+
+    #[tokio::test]
+    #[ignore = "requires a disposable localhost FREEPDB1 with user bench and DBGEN_TEST_PORT/PASSWORD"]
+    async fn commits_failures_and_cancellation() -> Result<()> {
+        let cli = Cli::try_parse_from(cli_args("oracle", "bench", "FREEPDB1")?)?;
+        let backend = Arc::new(OracleBackend::new(&cli)?);
+        let conn = backend.pool.get()?;
+        drop_table_sync(&conn, "dbgen_snapshot_test")?;
+        conn.execute(
+            "CREATE TABLE \"dbgen_snapshot_test\" (\"id\" NUMBER(10) PRIMARY KEY)",
+            &[],
+        )?;
+        let client = &conn;
+        let result = check_snapshot_chunks(backend.clone(), "dbgen_snapshot_test", || async move {
+            let row = client.query_row("SELECT COUNT(*) FROM \"dbgen_snapshot_test\"", &[])?;
+            Ok(row.get::<_, u64>(0)?)
+        })
+        .await;
+        drop_table_sync(&conn, "dbgen_snapshot_test")?;
+        result
+    }
 }
