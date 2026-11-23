@@ -19,8 +19,6 @@ cargo build --release
 
 Binaries: `target/release/pg`, `target/release/sqlserver`, `target/release/oracle`, `target/release/mysql`
 
-The Oracle binary requires the Oracle Instant Client libraries to be installed and on the linker path.
-
 ## Usage
 
 Binaries share the same subcommands and TPC-H options.
@@ -46,7 +44,7 @@ mysql snapshot [OPTIONS]
 | `--workers` | `8` | Shared snapshot writer count; connection pools grow to match |
 | `--commit-rows` | `100000` | Maximum rows per snapshot transaction |
 
-Tables are loaded in parallel. PostgreSQL uses `COPY BINARY`, SQL Server uses bulk insert, Oracle uses array-bound batch inserts, MySQL uses `LOAD DATA LOCAL INFILE`.
+Tables are loaded in parallel. PostgreSQL uses `COPY BINARY`, SQL Server uses bulk insert, Oracle binds each Arrow batch as one array insert, MySQL uses `LOAD DATA LOCAL INFILE`.
 
 Workers share chunks across tables, including the final large table. At most one
 Arrow chunk per worker is resident, plus generator and driver buffers; generation
@@ -55,8 +53,7 @@ is serialized and overlaps writes. Connections and commits remain backend-specif
 Progress logs every five seconds distinguish generated rows, successfully written
 batches, and acknowledged committed rows. Written rows can later roll back;
 a failed commit response has an unknown outcome. Errors and Ctrl-C stop new work
-and roll back unfinished chunks. PostgreSQL, MySQL and SQL Server let active database
-calls finish first, while Oracle's client cancels them. A second Ctrl-C exits
+and roll back unfinished chunks, letting active database calls finish first. A second Ctrl-C exits
 immediately, and the database rolls back open transactions when the connection drops. Earlier commits
 remain: this is **not an atomic snapshot or a resumable load**. Recreate the selected
 tables before retrying, for example with `--drop` on a disposable target. CDC is unchanged.
