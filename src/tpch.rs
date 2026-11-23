@@ -8,7 +8,7 @@ use arrow::array::{
     Array, Date32Array, Decimal128Array, Int32Array, Int64Array, StringArray, StringViewArray,
 };
 use arrow::datatypes::{DataType, Schema};
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchReader};
 use chrono::NaiveDate;
 use clap::{Args, Subcommand};
 use log::info;
@@ -18,8 +18,8 @@ use tpchgen::generators::{
     PartSuppGenerator, RegionGenerator, SupplierGenerator,
 };
 use tpchgen_arrow::{
-    CustomerArrow, LineItemArrow, NationArrow, OrderArrow, PartArrow, PartSuppArrow,
-    RecordBatchIterator, RegionArrow, SupplierArrow,
+    CustomerArrow, LineItemArrow, NationArrow, OrderArrow, PartArrow, PartSuppArrow, RegionArrow,
+    SupplierArrow,
 };
 
 pub const UNIX_EPOCH: NaiveDate = match NaiveDate::from_ymd_opt(1970, 1, 1) {
@@ -170,14 +170,14 @@ impl TpchTable {
 
     pub fn schema(&self) -> Arc<Schema> {
         match self {
-            TpchTable::Region(g) => g.schema().clone(),
-            TpchTable::Nation(g) => g.schema().clone(),
-            TpchTable::Supplier(g) => g.schema().clone(),
-            TpchTable::Customer(g) => g.schema().clone(),
-            TpchTable::Part(g) => g.schema().clone(),
-            TpchTable::PartSupp(g) => g.schema().clone(),
-            TpchTable::Orders(g) => g.schema().clone(),
-            TpchTable::LineItem(g) => g.schema().clone(),
+            TpchTable::Region(g) => g.schema(),
+            TpchTable::Nation(g) => g.schema(),
+            TpchTable::Supplier(g) => g.schema(),
+            TpchTable::Customer(g) => g.schema(),
+            TpchTable::Part(g) => g.schema(),
+            TpchTable::PartSupp(g) => g.schema(),
+            TpchTable::Orders(g) => g.schema(),
+            TpchTable::LineItem(g) => g.schema(),
         }
     }
 
@@ -199,7 +199,7 @@ impl Iterator for TpchTable {
     type Item = RecordBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self {
+        let batch = match self {
             TpchTable::Region(g) => g.next(),
             TpchTable::Nation(g) => g.next(),
             TpchTable::Supplier(g) => g.next(),
@@ -208,7 +208,9 @@ impl Iterator for TpchTable {
             TpchTable::PartSupp(g) => g.next(),
             TpchTable::Orders(g) => g.next(),
             TpchTable::LineItem(g) => g.next(),
-        }
+        }?;
+        // tpchgen-arrow only fails building a batch for its own fixed schema, a bug there.
+        Some(batch.expect("tpchgen-arrow batch matches its schema"))
     }
 }
 
