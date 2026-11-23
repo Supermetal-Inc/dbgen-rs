@@ -62,7 +62,8 @@ Progress logs every five seconds distinguish generated rows, successfully writte
 batches, and acknowledged committed rows. Written rows can later roll back;
 a failed commit response has an unknown outcome. Errors and Ctrl-C stop new work
 and roll back unfinished chunks. PostgreSQL, MySQL and SQL Server let active database
-calls finish first, while Oracle's client cancels them. Earlier commits
+calls finish first, while Oracle's client cancels them. A second Ctrl-C exits
+immediately, and the database rolls back open transactions when the connection drops. Earlier commits
 remain: this is **not an atomic snapshot or a resumable load**. Recreate the selected
 tables before retrying, for example with `--drop` on a disposable target. CDC is unchanged.
 

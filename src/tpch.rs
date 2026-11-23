@@ -501,9 +501,17 @@ async fn run_snapshot<B: TpchBackend>(backend: Arc<B>, args: SnapshotArgs) -> Re
         tokio::select! {
             result = &mut load => break result,
             _ = interval.tick() => progress.log(),
-            _ = tokio::signal::ctrl_c(), if !cancel.is_cancelled() => {
+            // Tokio replaces SIGINT's default action, so a call stuck on a lock would
+            // otherwise only die to SIGKILL. Open transactions roll back on disconnect.
+            _ = tokio::signal::ctrl_c() => {
+                if cancel.is_cancelled() {
+                    progress.log();
+                    std::process::exit(130);
+                }
                 cancel.cancel();
-                info!("Stopping snapshot admission; waiting for in-flight database calls");
+                info!(
+                    "Stopping snapshot admission; waiting for in-flight database calls (Ctrl-C again to exit now)"
+                );
             }
         }
     };
